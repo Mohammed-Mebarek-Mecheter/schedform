@@ -14,6 +14,11 @@ declare namespace Cloudflare {
 		BETTER_AUTH_URL: string;
 		POLAR_ACCESS_TOKEN: string;
 		POLAR_SUCCESS_URL: string;
+        POLAR_STARTER_PRODUCT_ID: string;
+        POLAR_PRO_PRODUCT_ID: string;
+        POLAR_BUSINESS_PRODUCT_ID: string;
+        APP_URL: string;
+        POLAR_WEBHOOK_SECRET: string;
 	}
 }
 interface CloudflareBindings extends Cloudflare.Env {}

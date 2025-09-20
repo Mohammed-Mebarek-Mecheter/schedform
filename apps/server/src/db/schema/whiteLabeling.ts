@@ -1,4 +1,4 @@
-// src/db/schema/whiteLabeling.ts
+﻿// src/db/schema/whiteLabeling.ts
 import {
     pgTable,
     text,
@@ -10,9 +10,11 @@ import {
     index,
     uniqueIndex,
 } from "drizzle-orm/pg-core";
-import { relations } from "drizzle-orm";
-import { user } from "./auth";
-import { teams } from "./business";
+import {relations, sql} from "drizzle-orm";
+import {user} from "@/db/schema/auth";
+import {teams} from "@/db/schema/business";
+import {supportedLanguages} from "@/db/schema/localization";
+
 
 /**
  * Enums for white-labeling
@@ -92,6 +94,14 @@ export const brandConfigurations = pgTable(
         customDomain: text("custom_domain"),
         whitelabelComplete: boolean("whitelabel_complete").notNull().default(false),
         hideSchedFormBranding: boolean("hide_sched_form_branding").notNull().default(true), // Free tier gets this!
+
+        defaultLanguage: text("default_language").references(() => supportedLanguages.code, { onDelete: "set null" }),
+        supportedLanguages: jsonb("supported_languages"), // Array of language codes this brand supports
+        autoDetectLanguage: boolean("auto_detect_language").notNull().default(true),
+
+        // Language-specific assets
+        localizedLogos: jsonb("localized_logos"), // { "en": "url", "es": "url" }
+        localizedFavicons: jsonb("localized_favicons"),
 
         // Usage and analytics
         usageCount: integer("usage_count").notNull().default(0),
@@ -277,6 +287,64 @@ export const brandingAnalytics = pgTable(
     })
 );
 
+/* ---------------- Brand Configuration Translations ---------------- */
+export const brandConfigurationTranslations = pgTable(
+    "brand_configuration_translations",
+    {
+        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
+        brandConfigId: text("brand_config_id").notNull().references(() => brandConfigurations.id, { onDelete: "cascade" }),
+        languageCode: text("language_code").notNull().references(() => supportedLanguages.code, { onDelete: "restrict" }),
+
+        // Translatable brand content
+        brandName: text("brand_name"),
+        welcomeMessage: text("welcome_message"),
+        thankYouMessage: text("thank_you_message"),
+        footerText: text("footer_text"),
+        emailSignature: text("email_signature"),
+
+        // Localized legal pages
+        privacyPolicyUrl: text("privacy_policy_url"),
+        termsOfServiceUrl: text("terms_of_service_url"),
+        companyAddress: text("company_address"),
+
+        // Custom messaging by language
+        customMessages: jsonb("custom_messages"), // { booking_success, cancellation_notice, etc. }
+
+        createdAt: timestamp("created_at").notNull().defaultNow(),
+        updatedAt: timestamp("updated_at").notNull().defaultNow(),
+    },
+    (t) => ({
+        uqBrandLanguage: uniqueIndex("brand_config_translations_brand_language_uq").on(t.brandConfigId, t.languageCode),
+        idxLanguage: index("brand_config_translations_language_idx").on(t.languageCode),
+
+        // Constraints
+        chkPrivacyUrl: sql`CHECK (privacy_policy_url IS NULL OR privacy_policy_url ~ '^https?://')`,
+        chkTermsUrl: sql`CHECK (terms_of_service_url IS NULL OR terms_of_service_url ~ '^https?://')`,
+    })
+);
+
+/* ---------------- White Label Template Translations ---------------- */
+export const whiteLabelTemplateTranslations = pgTable(
+    "white_label_template_translations",
+    {
+        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
+        templateId: text("template_id").notNull().references(() => whiteLabelTemplates.id, { onDelete: "cascade" }),
+        languageCode: text("language_code").notNull().references(() => supportedLanguages.code, { onDelete: "restrict" }),
+
+        name: text("name"),
+        description: text("description"),
+
+        // Translated template data (localized text content within the template)
+        localizedTemplateData: jsonb("localized_template_data"),
+
+        createdAt: timestamp("created_at").notNull().defaultNow(),
+        updatedAt: timestamp("updated_at").notNull().defaultNow(),
+    },
+    (t) => ({
+        uqTemplateLanguage: uniqueIndex("white_label_template_translations_template_language_uq").on(t.templateId, t.languageCode),
+    })
+);
+
 /* ============================
    Relations
    ============================ */
@@ -288,6 +356,11 @@ export const brandConfigurationsRelations = relations(brandConfigurations, ({ on
     customDomains: many(customDomains),
     brandAssets: many(brandAssets),
     analytics: many(brandingAnalytics),
+    translations: many(brandConfigurationTranslations),
+    defaultLanguageRef: one(supportedLanguages, {
+        fields: [brandConfigurations.defaultLanguage],
+        references: [supportedLanguages.code],
+    }),
 }));
 
 export const customDomainsRelations = relations(customDomains, ({ one }) => ({
@@ -300,10 +373,33 @@ export const brandAssetsRelations = relations(brandAssets, ({ one }) => ({
     owner: one(user, { fields: [brandAssets.userId], references: [user.id] }),
 }));
 
-export const whiteLabelTemplatesRelations = relations(whiteLabelTemplates, ({ one }) => ({
+export const whiteLabelTemplatesRelations = relations(whiteLabelTemplates, ({ one, many }) => ({
     creator: one(user, { fields: [whiteLabelTemplates.createdBy], references: [user.id] }),
+    translations: many(whiteLabelTemplateTranslations),
 }));
 
 export const brandingAnalyticsRelations = relations(brandingAnalytics, ({ one }) => ({
     brandConfig: one(brandConfigurations, { fields: [brandingAnalytics.brandConfigId], references: [brandConfigurations.id] }),
+}));
+
+export const brandConfigurationTranslationsRelations = relations(brandConfigurationTranslations, ({ one }) => ({
+    brandConfig: one(brandConfigurations, {
+        fields: [brandConfigurationTranslations.brandConfigId],
+        references: [brandConfigurations.id]
+    }),
+    language: one(supportedLanguages, {
+        fields: [brandConfigurationTranslations.languageCode],
+        references: [supportedLanguages.code]
+    }),
+}));
+
+export const whiteLabelTemplateTranslationsRelations = relations(whiteLabelTemplateTranslations, ({ one }) => ({
+    template: one(whiteLabelTemplates, {
+        fields: [whiteLabelTemplateTranslations.templateId],
+        references: [whiteLabelTemplates.id]
+    }),
+    language: one(supportedLanguages, {
+        fields: [whiteLabelTemplateTranslations.languageCode],
+        references: [supportedLanguages.code]
+    }),
 }));

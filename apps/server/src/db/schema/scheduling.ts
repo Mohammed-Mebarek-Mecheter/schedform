@@ -1,5 +1,4 @@
-// src/db/scheduling.ts
-
+// src/db/schema/scheduling.ts
 import {
     pgTable,
     text,
@@ -13,10 +12,10 @@ import {
     varchar,
     real
 } from "drizzle-orm/pg-core";
-import { relations } from "drizzle-orm";
-
-import { user } from "./auth";
-import { forms, formResponses } from "./forms";
+import { relations, sql } from "drizzle-orm";
+import {user} from "@/db/schema/auth";
+import {formResponses, forms} from "@/db/schema/forms";
+import {eventTypeTranslations, supportedLanguages} from "@/db/schema/localization";
 
 /* ============================
    Enums (Postgres pg_enum types)
@@ -68,276 +67,299 @@ export const noShowReasonEnum = pgEnum("no_show_reason", [
    ============================ */
 
 /**
- * calendar_connections
- * - per-user calendar OAuth connections
+ * Calendar connections - per-user calendar OAuth connections
  */
+
 export const calendarConnections = pgTable(
     "calendar_connections",
     {
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        userId: text("user_id").notNull().references(() => user.id, { onDelete: "cascade" }),
-
+        userId: text("user_id")
+            .notNull()
+            .references(() => user.id, { onDelete: "cascade" }),
         provider: calendarProviderEnum("provider").notNull(),
         name: text("name").notNull(),
         email: text("email").notNull(),
-
-        // OAuth tokens (store encrypted at application-level)
         accessToken: text("access_token").notNull(),
         refreshToken: text("refresh_token"),
-        tokenExpiresAt: timestamp("token_expires_at"),
-
-        // Calendar details
+        tokenExpiresAt: timestamp("token_expires_at", { mode: "date" }),
         calendarId: text("calendar_id").notNull(),
         timeZone: text("time_zone").notNull(),
-
-        // Settings
         isDefault: boolean("is_default").notNull().default(false),
         isActive: boolean("is_active").notNull().default(true),
-
-        // Sync status
-        lastSyncAt: timestamp("last_sync_at"),
+        lastSyncAt: timestamp("last_sync_at", { mode: "date" }),
         syncStatus: text("sync_status").notNull().default("pending"),
-        syncErrors: jsonb("sync_errors"), // Track sync issues
-
-        // Performance tracking
+        syncErrors: jsonb("sync_errors"),
         totalBookings: integer("total_bookings").notNull().default(0),
         failedSyncs: integer("failed_syncs").notNull().default(0),
-
-        createdAt: timestamp("created_at").notNull().defaultNow(),
-        updatedAt: timestamp("updated_at").notNull().defaultNow(),
+        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
+        updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
     },
     (t) => ({
         idxUser: index("calendar_connections_user_idx").on(t.userId),
-        uqUserDefault: uniqueIndex("calendar_connections_user_default_uq").on(t.userId, t.isDefault),
-    })
+        uqUserDefault: uniqueIndex("calendar_connections_user_default_uq")
+            .on(t.userId, t.isDefault)
+            .where(sql`${t.isDefault} = true`),
+        chkEmail: sql`CHECK (${t.email} ~ '^[^@]+@[^@]+\\.[^@]+')`,
+        chkTotals: sql`CHECK (${t.totalBookings} >= 0 AND ${t.failedSyncs} >= 0)`,
+    }),
 );
 
 /**
- * event_types
- * - meeting templates (duration, behavior, branding) - Enhanced for SchedForm integration
+ * Event types - meeting templates with proper validation
  */
 export const eventTypes = pgTable(
     "event_types",
     {
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        userId: text("user_id").notNull().references(() => user.id, { onDelete: "cascade" }),
-        formId: text("form_id").references(() => forms.id, { onDelete: "cascade" }),
-
+        userId: text("user_id")
+            .notNull()
+            .references(() => user.id, { onDelete: "restrict" }),
+        formId: text("form_id").references(() => forms.id, { onDelete: "set null" }),
         title: text("title").notNull(),
         description: text("description"),
         slug: text("slug").notNull(),
-
-        // Meeting configuration
-        duration: integer("duration").notNull(), // minutes
+        regionalSettings: jsonb("regional_settings"),
+        defaultLanguage: text("default_language").references(() => supportedLanguages.code, { onDelete: "set null" }),
+        supportedLanguages: jsonb("supported_languages"), // Array of language codes
+        autoDetectLanguage: boolean("auto_detect_language").notNull().default(true),
+        localizedConfirmationTemplates: jsonb("localized_confirmation_templates"), // Per language
+        localizedReminderTemplates: jsonb("localized_reminder_templates"),
+        localizedCancellationTemplates: jsonb("localized_cancellation_templates"),
+        duration: integer("duration").notNull(),
         bufferTimeBefore: integer("buffer_time_before").notNull().default(0),
         bufferTimeAfter: integer("buffer_time_after").notNull().default(0),
-
-        // Availability windows
-        minimumNotice: integer("minimum_notice").notNull().default(60), // minutes
+        minimumNotice: integer("minimum_notice").notNull().default(60),
         maximumDaysOut: integer("maximum_days_out").notNull().default(30),
-
-        // Meeting details
         meetingType: meetingTypeEnum("meeting_type").notNull().default("video"),
         location: text("location"),
-        meetingUrl: text("meeting_url"), // Fixed meeting URL if not dynamic
-
-        // SchedForm's core scheduling modes
+        meetingUrl: text("meeting_url"),
         schedulingMode: schedulingModeEnum("scheduling_mode").notNull().default("instant"),
         requiresApproval: boolean("requires_approval").notNull().default(false),
-
-        // Enhanced booking limits
         maxBookingsPerDay: integer("max_bookings_per_day"),
         maxBookingsPerWeek: integer("max_bookings_per_week"),
-        maxBookingsPerMonth: integer("max_bookings_per_month"), // New
-        bookingFrequencyLimit: integer("booking_frequency_limit"), // days between bookings from same person
-
-        // SchedForm-specific features
-        dynamicDuration: boolean("dynamic_duration").notNull().default(false), // AI can adjust duration
+        maxBookingsPerMonth: integer("max_bookings_per_month"),
+        bookingFrequencyLimit: integer("booking_frequency_limit"),
+        dynamicDuration: boolean("dynamic_duration").notNull().default(false),
         singleUseLinks: boolean("single_use_links").notNull().default(false),
-        enableAiOptimization: boolean("enable_ai_optimization").notNull().default(true), // Use AI for slot suggestions
-
-        // Enhanced verification requirements
+        enableAiOptimization: boolean("enable_ai_optimization").notNull().default(true),
         requireEmailVerification: boolean("require_email_verification").notNull().default(true),
         requireSmsVerification: boolean("require_sms_verification").notNull().default(false),
-        highValueThreshold: integer("high_value_threshold"), // Qualification score threshold for extra verification
-
-        // White-labeling and branding
+        highValueThreshold: integer("high_value_threshold"),
         customBranding: boolean("custom_branding").notNull().default(false),
         primaryColor: text("primary_color").notNull().default("#3b82f6"),
         logoUrl: text("logo_url"),
-        brandingConfig: jsonb("branding_config"), // Comprehensive branding settings
-
-        // Qualification requirements
-        minimumQualificationScore: real("minimum_qualification_score"), // Minimum score to book
+        brandingConfig: jsonb("branding_config"),
+        minimumQualificationScore: real("minimum_qualification_score"),
         requiresManualReview: boolean("requires_manual_review").notNull().default(false),
-        qualificationCriteria: jsonb("qualification_criteria"), // Custom qualification rules
-
-        // Pricing (for paid event types)
-        price: real("price"), // Cost per meeting
+        qualificationCriteria: jsonb("qualification_criteria"),
+        price: real("price"),
         currency: text("currency").default("USD"),
         paymentRequired: boolean("payment_required").notNull().default(false),
-
-        // Analytics and performance
         totalBookings: integer("total_bookings").notNull().default(0),
         completedBookings: integer("completed_bookings").notNull().default(0),
         noShowRate: real("no_show_rate").notNull().default(0),
         averageQualificationScore: real("average_qualification_score").notNull().default(0),
-
-        // Status
         isActive: boolean("is_active").notNull().default(true),
-        archivedAt: timestamp("archived_at"),
-
-        createdAt: timestamp("created_at").notNull().defaultNow(),
-        updatedAt: timestamp("updated_at").notNull().defaultNow(),
+        archivedAt: timestamp("archived_at", { mode: "date" }),
+        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
+        updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
     },
     (t) => ({
-        idxUser: index("event_types_user_idx").on(t.userId),
         uqSlug: uniqueIndex("event_types_slug_uq").on(t.slug),
-        idxForm: index("event_types_form_idx").on(t.formId),
-        idxActive: index("event_types_active_idx").on(t.isActive),
-    })
+        idxUserActive: index("event_types_user_active_idx").on(t.userId, t.isActive),
+        idxForm: index("event_types_form_idx").on(t.formId).where(sql`${t.formId} IS NOT NULL`),
+
+        // ✅ move checks here
+        chkDuration: sql`CHECK (${t.duration} > 0 AND ${t.duration} <= 1440)`,
+        chkBufferBefore: sql`CHECK (${t.bufferTimeBefore} >= 0 AND ${t.bufferTimeBefore} <= 240)`,
+        chkBufferAfter: sql`CHECK (${t.bufferTimeAfter} >= 0 AND ${t.bufferTimeAfter} <= 240)`,
+        chkMinimumNotice: sql`CHECK (${t.minimumNotice} >= 0)`,
+        chkMaximumDaysOut: sql`CHECK (${t.maximumDaysOut} > 0 AND ${t.maximumDaysOut} <= 365)`,
+        chkMeetingUrl: sql`CHECK (${t.meetingUrl} IS NULL OR ${t.meetingUrl} ~ '^https?://')`,
+        chkPrimaryColor: sql`CHECK (${t.primaryColor} ~ '^#[0-9A-Fa-f]{6}$')`,
+        chkHighValue: sql`CHECK (${t.highValueThreshold} IS NULL OR (${t.highValueThreshold} >= 0 AND ${t.highValueThreshold} <= 100))`,
+        chkMinQual: sql`CHECK (${t.minimumQualificationScore} IS NULL OR (${t.minimumQualificationScore} >= 0 AND ${t.minimumQualificationScore} <= 100))`,
+        chkPrice: sql`CHECK (${t.price} IS NULL OR ${t.price} >= 0)`,
+        chkTotals: sql`CHECK (${t.totalBookings} >= 0 AND ${t.completedBookings} >= 0)`,
+        chkNoShowRate: sql`CHECK (${t.noShowRate} >= 0 AND ${t.noShowRate} <= 100)`,
+        chkAvgQualScore: sql`CHECK (${t.averageQualificationScore} >= 0 AND ${t.averageQualificationScore} <= 100)`,
+    }),
 );
 
 /**
- * availability_slots - Enhanced with AI optimization scores
+ * Availability slots - optimized indexing
  */
 export const availabilitySlots = pgTable(
     "availability_slots",
     {
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        eventTypeId: text("event_type_id").notNull().references(() => eventTypes.id, { onDelete: "cascade" }),
-        calendarConnectionId: text("calendar_connection_id").notNull().references(() => calendarConnections.id, {
-            onDelete: "cascade",
-        }),
+        eventTypeId: text("event_type_id")
+            .notNull()
+            .references(() => eventTypes.id, { onDelete: "cascade" }),
+        calendarConnectionId: text("calendar_connection_id")
+            .notNull()
+            .references(() => calendarConnections.id, { onDelete: "cascade" }),
 
-        startTime: timestamp("start_time").notNull(),
-        endTime: timestamp("end_time").notNull(),
+        startTime: timestamp("start_time", { mode: "date" }).notNull(),
+        endTime: timestamp("end_time", { mode: "date" }).notNull(),
         timeZone: text("time_zone").notNull(),
 
         isAvailable: boolean("is_available").notNull().default(true),
         isBlocked: boolean("is_blocked").notNull().default(false),
 
-        // AI optimization
-        optimalityScore: integer("optimality_score"), // 0-100, how optimal is this slot
-        aiRecommendationReason: text("ai_recommendation_reason"), // Why AI recommends this slot
+        optimalityScore: integer("optimality_score"),
+        aiRecommendationReason: text("ai_recommendation_reason"),
 
-        // Booking limits per slot
-        maxBookings: integer("max_bookings").default(1), // Allow multiple bookings per slot if needed
+        maxBookings: integer("max_bookings").default(1),
         currentBookings: integer("current_bookings").default(0),
 
-        createdAt: timestamp("created_at").notNull().defaultNow(),
-        updatedAt: timestamp("updated_at").notNull().defaultNow(),
+        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
+        updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
     },
     (t) => ({
-        idxEventStart: index("availability_event_start_idx").on(t.eventTypeId, t.startTime),
-        idxCalendarStart: index("availability_calendar_start_idx").on(t.calendarConnectionId, t.startTime),
-        idxOptimality: index("availability_optimality_idx").on(t.optimalityScore),
-        uqCalendarSlot: uniqueIndex("availability_calendar_start_uq").on(t.calendarConnectionId, t.startTime),
-    })
+        idxEventTimeAvailable: index("availability_slots_event_time_available_idx")
+            .on(t.eventTypeId, t.startTime, t.isAvailable),
+        idxCalendarTime: index("availability_slots_calendar_time_idx").on(
+            t.calendarConnectionId,
+            t.startTime,
+        ),
+        uqCalendarSlot: uniqueIndex("availability_slots_calendar_time_uq").on(
+            t.calendarConnectionId,
+            t.startTime,
+        ),
+        chkOptimality: sql`CHECK (${t.optimalityScore} IS NULL OR (${t.optimalityScore} >= 0 AND ${t.optimalityScore} <= 100))`,
+        chkMaxBookings: sql`CHECK (${t.maxBookings} > 0)`,
+        chkCurrentBookings: sql`CHECK (${t.currentBookings} >= 0)`,
+    }),
 );
 
 /**
- * availability_rules - Enhanced with more flexible scheduling
+ * Availability rules - simplified indexing
  */
 export const availabilityRules = pgTable(
     "availability_rules",
     {
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        userId: text("user_id").notNull().references(() => user.id, { onDelete: "cascade" }),
-        eventTypeId: text("event_type_id").references(() => eventTypes.id, { onDelete: "cascade" }),
+        userId: text("user_id")
+            .notNull()
+            .references(() => user.id, { onDelete: "cascade" }),
+        eventTypeId: text("event_type_id").references(() => eventTypes.id, {
+            onDelete: "cascade",
+        }),
 
         name: text("name").notNull(),
-        dayOfWeek: integer("day_of_week").notNull(), // 0 = Sunday
+        dayOfWeek: integer("day_of_week").notNull(),
         startTime: text("start_time").notNull(), // HH:MM
         endTime: text("end_time").notNull(), // HH:MM
         timeZone: text("time_zone").notNull(),
 
-        // Enhanced scheduling rules
-        validFrom: timestamp("valid_from"),
-        validUntil: timestamp("valid_until"),
+        validFrom: timestamp("valid_from", { mode: "date" }),
+        validUntil: timestamp("valid_until", { mode: "date" }),
         maxBookingsPerSlot: integer("max_bookings_per_slot").default(1),
 
-        // Recurring patterns
-        recurringPattern: jsonb("recurring_pattern"), // For complex recurring rules
-        exceptions: jsonb("exceptions"), // Specific date exceptions
+        recurringPattern: jsonb("recurring_pattern"),
+        exceptions: jsonb("exceptions"),
 
         isActive: boolean("is_active").notNull().default(true),
 
-        createdAt: timestamp("created_at").notNull().defaultNow(),
-        updatedAt: timestamp("updated_at").notNull().defaultNow(),
+        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
+        updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
     },
     (t) => ({
-        idxUser: index("availability_rules_user_idx").on(t.userId, t.isActive),
-        idxEventType: index("availability_rules_event_type_idx").on(t.eventTypeId),
-    })
+        idxUserActive: index("availability_rules_user_active_idx").on(
+            t.userId,
+            t.isActive,
+        ),
+        idxEventType: index("availability_rules_event_type_idx")
+            .on(t.eventTypeId)
+            .where(sql`${t.eventTypeId} IS NOT NULL`),
+        idxDayTime: index("availability_rules_day_time_idx").on(
+            t.dayOfWeek,
+            t.startTime,
+        ),
+        chkDayOfWeek: sql`CHECK (${t.dayOfWeek} >= 0 AND ${t.dayOfWeek} <= 6)`,
+        chkMaxBookingsPerSlot: sql`CHECK (${t.maxBookingsPerSlot} > 0)`,
+    }),
 );
 
 /**
- * blocked_times - Enhanced with more context
+ * Blocked times - optimized
  */
 export const blockedTimes = pgTable(
     "blocked_times",
     {
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        userId: text("user_id").notNull().references(() => user.id, { onDelete: "cascade" }),
-        calendarConnectionId: text("calendar_connection_id").references(() => calendarConnections.id, { onDelete: "cascade" }),
+        userId: text("user_id")
+            .notNull()
+            .references(() => user.id, { onDelete: "cascade" }),
+        calendarConnectionId: text("calendar_connection_id").references(
+            () => calendarConnections.id,
+            { onDelete: "cascade" },
+        ),
 
-        startTime: timestamp("start_time").notNull(),
-        endTime: timestamp("end_time").notNull(),
+        startTime: timestamp("start_time", { mode: "date" }).notNull(),
+        endTime: timestamp("end_time", { mode: "date" }).notNull(),
         timeZone: text("time_zone").notNull(),
 
         title: text("title").notNull(),
         description: text("description"),
         isAllDay: boolean("is_all_day").notNull().default(false),
 
-        // External calendar integration
         externalEventId: text("external_event_id"),
         isRecurring: boolean("is_recurring").notNull().default(false),
 
-        // Block type and priority
-        blockType: text("block_type").default("busy"), // busy, tentative, out_of_office, focus_time
-        blockPriority: integer("block_priority").default(1), // 1-5, higher = more important
+        blockType: text("block_type").default("busy"),
+        blockPriority: integer("block_priority").default(1),
 
-        // Auto-sync from external calendars
-        isSyncedFromExternal: boolean("is_synced_from_external").notNull().default(false),
-        lastSyncedAt: timestamp("last_synced_at"),
+        isSyncedFromExternal: boolean("is_synced_from_external")
+            .notNull()
+            .default(false),
+        lastSyncedAt: timestamp("last_synced_at", { mode: "date" }),
 
-        createdAt: timestamp("created_at").notNull().defaultNow(),
-        updatedAt: timestamp("updated_at").notNull().defaultNow(),
+        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
+        updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
     },
     (t) => ({
-        idxUser: index("blocked_times_user_idx").on(t.userId),
-        idxCalendar: index("blocked_times_calendar_idx").on(t.calendarConnectionId),
-        idxTimeRange: index("blocked_times_time_range_idx").on(t.startTime, t.endTime),
-    })
+        idxUserTimeRange: index("blocked_times_user_time_range_idx").on(
+            t.userId,
+            t.startTime,
+            t.endTime,
+        ),
+        idxCalendarTime: index("blocked_times_calendar_time_idx")
+            .on(t.calendarConnectionId, t.startTime)
+            .where(sql`${t.calendarConnectionId} IS NOT NULL`),
+        chkBlockPriority: sql`CHECK (${t.blockPriority} >= 1 AND ${t.blockPriority} <= 5)`,
+    }),
 );
 
 /**
- * bookings - Enhanced for SchedForm's conversational flow
+ * Bookings - comprehensive with proper validation
  */
 export const bookings = pgTable(
     "bookings",
     {
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        eventTypeId: text("event_type_id").notNull().references(() => eventTypes.id, { onDelete: "cascade" }),
-        formResponseId: text("form_response_id").references(() => formResponses.id, { onDelete: "set null" }),
-        calendarConnectionId: text("calendar_connection_id").notNull().references(() => calendarConnections.id, {
-            onDelete: "cascade",
+        eventTypeId: text("event_type_id")
+            .notNull()
+            .references(() => eventTypes.id, { onDelete: "restrict" }),
+        formResponseId: text("form_response_id").references(() => formResponses.id, {
+            onDelete: "set null",
         }),
+        calendarConnectionId: text("calendar_connection_id")
+            .notNull()
+            .references(() => calendarConnections.id, { onDelete: "restrict" }),
 
-        // Meeting time
-        startTime: timestamp("start_time").notNull(),
-        endTime: timestamp("end_time").notNull(),
+        startTime: timestamp("start_time", { mode: "date" }).notNull(),
+        endTime: timestamp("end_time", { mode: "date" }).notNull(),
         timeZone: text("time_zone").notNull(),
 
-        // Enhanced guest information
         guestName: text("guest_name").notNull(),
         guestEmail: text("guest_email").notNull(),
         guestPhone: varchar("guest_phone", { length: 64 }),
         guestCompany: text("guest_company"),
         guestTitle: text("guest_title"),
 
-        // Meeting configuration
         meetingType: meetingTypeEnum("meeting_type").notNull(),
         location: text("location"),
         meetingUrl: text("meeting_url"),
@@ -345,55 +367,50 @@ export const bookings = pgTable(
         meetingPassword: text("meeting_password"),
         dialInNumber: text("dial_in_number"),
 
-        // Enhanced status tracking
         status: bookingStatusEnum("status").notNull().default("draft"),
-        statusHistory: jsonb("status_history"), // Track all status changes
+        statusHistory: jsonb("status_history"),
         confirmationCode: text("confirmation_code"),
 
-        // Cancellation and rescheduling
         cancellationReason: text("cancellation_reason"),
-        cancelledAt: timestamp("cancelled_at"),
-        cancelledBy: text("cancelled_by"), // 'host' | 'guest' | 'system'
+        cancelledAt: timestamp("cancelled_at", { mode: "date" }),
+        cancelledBy: text("cancelled_by"),
         rescheduleCount: integer("reschedule_count").notNull().default(0),
-        originalBookingId: text("original_booking_id"), // For reschedule chain tracking
+        originalBookingId: text("original_booking_id"),
 
-        // SchedForm-specific: Qualification and AI insights
-        qualificationScore: real("qualification_score"), // Score from conversational flow
-        qualificationSummary: text("qualification_summary"), // AI-generated summary
-        priorityScore: integer("priority_score"), // 1-100, how important is this prospect
-        intentScore: integer("intent_score"), // 1-100, how serious is their intent
+        qualificationScore: real("qualification_score"),
+        qualificationSummary: text("qualification_summary"),
+        priorityScore: integer("priority_score"),
+        intentScore: integer("intent_score"),
 
-        // Prospect insights for meeting preparation
-        prospectInsights: jsonb("prospect_insights"), // AI-generated insights about the prospect
-        meetingPreparation: jsonb("meeting_preparation"), // AI-suggested preparation tasks
-        expectedOutcome: text("expected_outcome"), // What we expect from this meeting
+        prospectInsights: jsonb("prospect_insights"),
+        meetingPreparation: jsonb("meeting_preparation"),
+        expectedOutcome: text("expected_outcome"),
 
-        // Verification status
         emailVerified: boolean("email_verified").notNull().default(false),
         emailVerificationToken: text("email_verification_token"),
-        emailVerifiedAt: timestamp("email_verified_at"),
+        emailVerifiedAt: timestamp("email_verified_at", { mode: "date" }),
 
         smsVerified: boolean("sms_verified").notNull().default(false),
         smsVerificationToken: text("sms_verification_token"),
-        smsVerifiedAt: timestamp("sms_verified_at"),
+        smsVerifiedAt: timestamp("sms_verified_at", { mode: "date" }),
 
-        // Calendar integration
         externalCalendarEventId: text("external_calendar_event_id"),
-        calendarEventCreated: boolean("calendar_event_created").notNull().default(false),
+        calendarEventCreated: boolean("calendar_event_created")
+            .notNull()
+            .default(false),
         calendarEventError: text("calendar_event_error"),
 
-        // No-show tracking
         noShowReason: noShowReasonEnum("no_show_reason"),
-        noShowDetectedAt: timestamp("no_show_detected_at"),
-        noShowFollowUpSent: boolean("no_show_follow_up_sent").notNull().default(false),
+        noShowDetectedAt: timestamp("no_show_detected_at", { mode: "date" }),
+        noShowFollowUpSent: boolean("no_show_follow_up_sent")
+            .notNull()
+            .default(false),
 
-        // Pricing and payment
         price: real("price"),
         currency: text("currency"),
-        paymentStatus: text("payment_status"), // pending, paid, refunded, failed
-        paymentIntentId: text("payment_intent_id"), // Stripe payment intent ID
+        paymentStatus: text("payment_status"),
+        paymentIntentId: text("payment_intent_id"),
 
-        // Enhanced metadata
         ipAddress: varchar("ip_address", { length: 45 }),
         userAgent: text("user_agent"),
         utmSource: varchar("utm_source", { length: 128 }),
@@ -401,168 +418,232 @@ export const bookings = pgTable(
         utmCampaign: varchar("utm_campaign", { length: 128 }),
         referrer: text("referrer"),
 
-        // Performance tracking
-        bookingDuration: integer("booking_duration"), // Time to complete booking flow in seconds
-        conversionSource: text("conversion_source"), // How they found the booking page
+        bookingDuration: integer("booking_duration"),
+        conversionSource: text("conversion_source"),
 
-        createdAt: timestamp("created_at").notNull().defaultNow(),
-        updatedAt: timestamp("updated_at").notNull().defaultNow(),
+        detectedLanguage: text("detected_language").references(() => supportedLanguages.code, { onDelete: "set null" }),
+        preferredLanguage: text("preferred_language").references(() => supportedLanguages.code, { onDelete: "set null" }),
+
+        // Timezone and locale preferences
+        detectedTimezone: text("detected_timezone"),
+        preferredDateFormat: text("preferred_date_format"),
+        preferredTimeFormat: text("preferred_time_format"),
+
+        // Localized meeting details
+        localizedMeetingDetails: jsonb("localized_meeting_details"), // Meeting info in guest's language
+        localizedPreparationTips: jsonb("localized_preparation_tips"),
+
+        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
+        updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
     },
     (t) => ({
-        uqConfirmationCode: uniqueIndex("bookings_confirmation_code_uq").on(t.confirmationCode),
-        idxEventStart: index("bookings_event_start_idx").on(t.eventTypeId, t.startTime),
-        idxCalendarStart: index("bookings_calendar_start_idx").on(t.calendarConnectionId, t.startTime),
-        idxStatus: index("bookings_status_idx").on(t.status),
-        idxGuest: index("bookings_guest_idx").on(t.guestEmail),
-        idxQualification: index("bookings_qualification_idx").on(t.qualificationScore),
-        idxPriority: index("bookings_priority_idx").on(t.priorityScore),
-    })
+        uqConfirmationCode: uniqueIndex("bookings_confirmation_code_uq")
+            .on(t.confirmationCode)
+            .where(sql`${t.confirmationCode} IS NOT NULL`),
+        idxEventStartStatus: index("bookings_event_start_status_idx").on(
+            t.eventTypeId,
+            t.startTime,
+            t.status,
+        ),
+        idxGuestEmail: index("bookings_guest_email_idx").on(t.guestEmail),
+        idxStartTime: index("bookings_start_time_idx").on(t.startTime),
+        idxCreated: index("bookings_created_idx").on(t.createdAt),
+
+        chkGuestEmail: sql`CHECK (${t.guestEmail} ~ '^[^@]+@[^@]+\\.[^@]+')`,
+        chkMeetingUrl: sql`CHECK (${t.meetingUrl} IS NULL OR ${t.meetingUrl} ~ '^https?://')`,
+        chkRescheduleCount: sql`CHECK (${t.rescheduleCount} >= 0)`,
+        chkQualificationScore: sql`CHECK (${t.qualificationScore} IS NULL OR (${t.qualificationScore} >= 0 AND ${t.qualificationScore} <= 100))`,
+        chkPriorityScore: sql`CHECK (${t.priorityScore} IS NULL OR (${t.priorityScore} >= 1 AND ${t.priorityScore} <= 100))`,
+        chkIntentScore: sql`CHECK (${t.intentScore} IS NULL OR (${t.intentScore} >= 1 AND ${t.intentScore} <= 100))`,
+        chkPrice: sql`CHECK (${t.price} IS NULL OR ${t.price} >= 0)`,
+        chkBookingDuration: sql`CHECK (${t.bookingDuration} IS NULL OR ${t.bookingDuration} > 0)`,
+    }),
 );
 
 /**
- * booking_reminders - Enhanced with more reminder types
+ * Booking reminders - simplified
  */
 export const bookingReminders = pgTable(
     "booking_reminders",
     {
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        bookingId: text("booking_id").notNull().references(() => bookings.id, { onDelete: "cascade" }),
+        bookingId: text("booking_id")
+            .notNull()
+            .references(() => bookings.id, { onDelete: "cascade" }),
 
         type: text("type").notNull(), // 'email' | 'sms' | 'both' | 'push'
         triggerMinutes: integer("trigger_minutes").notNull(), // Minutes before meeting
 
-        // Enhanced reminder configuration
-        reminderTemplate: text("reminder_template"), // Template ID or name
-        customMessage: text("custom_message"), // Override default message
-        includeQualificationSummary: boolean("include_qualification_summary").notNull().default(false),
-        includePreparationTips: boolean("include_preparation_tips").notNull().default(false),
+        // Configuration
+        reminderTemplate: text("reminder_template"),
+        customMessage: text("custom_message"),
+        includeQualificationSummary: boolean("include_qualification_summary")
+            .notNull()
+            .default(false),
+        includePreparationTips: boolean("include_preparation_tips")
+            .notNull()
+            .default(false),
 
         status: reminderStatusEnum("status").notNull().default("pending"),
-        sentAt: timestamp("sent_at"),
-        deliveredAt: timestamp("delivered_at"),
+        sentAt: timestamp("sent_at", { mode: "date" }),
+        deliveredAt: timestamp("delivered_at", { mode: "date" }),
         failureReason: text("failure_reason"),
 
         subject: text("subject"),
         message: text("message"),
 
         // Delivery tracking
-        externalId: text("external_id"), // ID from email/SMS provider
-        deliveryStatus: text("delivery_status"), // delivered, bounced, opened, clicked
+        externalId: text("external_id"),
+        deliveryStatus: text("delivery_status"),
 
-        createdAt: timestamp("created_at").notNull().defaultNow(),
+        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
     },
     (t) => ({
-        idxBookingTrigger: index("booking_reminders_booking_trigger_idx").on(t.bookingId, t.triggerMinutes),
-        idxStatus: index("booking_reminders_status_idx").on(t.status),
-    })
+        idxBookingTrigger: index("booking_reminders_booking_trigger_idx").on(
+            t.bookingId,
+            t.triggerMinutes,
+        ),
+        idxStatusPending: index("booking_reminders_status_pending_idx")
+            .on(t.status, t.sentAt)
+            .where(sql`${t.status} = 'pending'`),
+        chkTriggerMinutes: sql`CHECK (${t.triggerMinutes} > 0)`,
+    }),
 );
 
 /**
- * meeting_feedback - Enhanced with more detailed outcomes
+ * Meeting feedback - enhanced tracking
  */
 export const meetingFeedback = pgTable(
     "meeting_feedback",
     {
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        bookingId: text("booking_id").notNull().references(() => bookings.id, { onDelete: "cascade" }),
+        bookingId: text("booking_id")
+            .notNull()
+            .references(() => bookings.id, { onDelete: "cascade" }),
 
         // Ratings
-        hostRating: integer("host_rating"), // 1-5 stars from guest
-        guestRating: integer("guestRating"), // 1-5 stars from host
-        overallSatisfaction: integer("overall_satisfaction"), // 1-5 composite score
+        hostRating: integer("host_rating"),
+        guestRating: integer("guest_rating"),
+        overallSatisfaction: integer("overall_satisfaction"),
 
-        // Meeting outcomes
-        outcome: text("outcome"), // qualified, not_qualified, demo_scheduled, contract_sent, etc.
+        // Outcomes
+        outcome: text("outcome"),
         notes: text("notes"),
         nextSteps: text("next_steps"),
 
         // Enhanced tracking
         wasNoShow: boolean("was_no_show").notNull().default(false),
         wasSpam: boolean("was_spam").notNull().default(false),
-        wasQualified: boolean("was_qualified"), // Did they meet qualification criteria in the actual meeting?
-        qualityScore: integer("quality_score"), // 1-100, overall lead quality
+        wasQualified: boolean("was_qualified"),
+        qualityScore: integer("quality_score"),
 
-        // Follow-up tracking
+        // Follow-up
         followUpRequired: boolean("follow_up_required").notNull().default(false),
         followUpCompleted: boolean("follow_up_completed").notNull().default(false),
-        followUpDate: timestamp("follow_up_date"),
+        followUpDate: timestamp("follow_up_date", { mode: "date" }),
 
         // Business impact
-        estimatedValue: real("estimated_value"), // Potential deal value
-        closeProbability: integer("close_probability"), // 0-100, likelihood of closing deal
-        timeToClose: integer("time_to_close"), // Estimated days to close
+        estimatedValue: real("estimated_value"),
+        closeProbability: integer("close_probability"),
+        timeToClose: integer("time_to_close"),
 
-        // AI analysis of meeting
-        aiMeetingSummary: text("ai_meeting_summary"), // AI-generated meeting summary
+        // AI analysis
+        aiMeetingSummary: text("ai_meeting_summary"),
         aiNextStepsRecommendation: text("ai_next_steps_recommendation"),
 
-        createdAt: timestamp("created_at").notNull().defaultNow(),
-        updatedAt: timestamp("updated_at").notNull().defaultNow(),
+        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
+        updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
     },
     (t) => ({
-        idxBookingFeedback: index("meeting_feedback_booking_idx").on(t.bookingId),
-        idxOutcome: index("meeting_feedback_outcome_idx").on(t.outcome),
-        idxQuality: index("meeting_feedback_quality_idx").on(t.qualityScore),
-    })
+        uqBooking: uniqueIndex("meeting_feedback_booking_uq").on(t.bookingId),
+        idxOutcome: index("meeting_feedback_outcome_idx")
+            .on(t.outcome)
+            .where(sql`${t.outcome} IS NOT NULL`),
+
+        chkHostRating: sql`CHECK (${t.hostRating} IS NULL OR (${t.hostRating} >= 1 AND ${t.hostRating} <= 5))`,
+        chkGuestRating: sql`CHECK (${t.guestRating} IS NULL OR (${t.guestRating} >= 1 AND ${t.guestRating} <= 5))`,
+        chkOverallSatisfaction: sql`CHECK (${t.overallSatisfaction} IS NULL OR (${t.overallSatisfaction} >= 1 AND ${t.overallSatisfaction} <= 5))`,
+        chkQualityScore: sql`CHECK (${t.qualityScore} IS NULL OR (${t.qualityScore} >= 1 AND ${t.qualityScore} <= 100))`,
+        chkEstimatedValue: sql`CHECK (${t.estimatedValue} IS NULL OR ${t.estimatedValue} >= 0)`,
+        chkCloseProbability: sql`CHECK (${t.closeProbability} IS NULL OR (${t.closeProbability} >= 0 AND ${t.closeProbability} <= 100))`,
+        chkTimeToClose: sql`CHECK (${t.timeToClose} IS NULL OR ${t.timeToClose} > 0)`,
+    }),
 );
 
 /**
- * team_assignments - Enhanced for better round-robin and weighted assignment
+ * Team assignments - simplified for performance
  */
 export const teamAssignments = pgTable(
     "team_assignments",
     {
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        eventTypeId: text("event_type_id").notNull().references(() => eventTypes.id, { onDelete: "cascade" }),
-        userId: text("user_id").notNull().references(() => user.id, { onDelete: "cascade" }),
+        eventTypeId: text("event_type_id")
+            .notNull()
+            .references(() => eventTypes.id, { onDelete: "cascade" }),
+        userId: text("user_id")
+            .notNull()
+            .references(() => user.id, { onDelete: "cascade" }),
 
         // Assignment configuration
-        weight: integer("weight").notNull().default(1), // Higher weight = more assignments
+        weight: integer("weight").notNull().default(1),
         isActive: boolean("is_active").notNull().default(true),
 
-        // Limits and constraints
+        // Limits
         maxBookingsPerDay: integer("max_bookings_per_day"),
         maxBookingsPerWeek: integer("max_bookings_per_week"),
         maxBookingsPerMonth: integer("max_bookings_per_month"),
 
-        // Assignment rules and criteria
-        assignmentRules: jsonb("assignment_rules"), // Complex assignment logic
-        qualificationRequirements: jsonb("qualification_requirements"), // Only assign certain types of prospects
-
-        // Availability overrides
-        availabilityOverrides: jsonb("availability_overrides"), // Team member specific availability
-        timeZonePreferences: jsonb("time_zone_preferences"), // Preferred time zones
+        // Configuration
+        assignmentRules: jsonb("assignment_rules"),
+        qualificationRequirements: jsonb("qualification_requirements"),
+        availabilityOverrides: jsonb("availability_overrides"),
+        timeZonePreferences: jsonb("time_zone_preferences"),
 
         // Performance tracking
         totalAssignments: integer("total_assignments").notNull().default(0),
         completedMeetings: integer("completed_meetings").notNull().default(0),
         noShows: integer("no_shows").notNull().default(0),
         averageRating: real("average_rating").notNull().default(0),
-        lastAssignedAt: timestamp("last_assigned_at"),
+        lastAssignedAt: timestamp("last_assigned_at", { mode: "date" }),
 
-        createdAt: timestamp("created_at").notNull().defaultNow(),
-        updatedAt: timestamp("updated_at").notNull().defaultNow(),
+        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
+        updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
     },
     (t) => ({
-        idxEventUser: index("team_assignments_event_user_idx").on(t.eventTypeId, t.userId),
-        uqEventUser: uniqueIndex("team_assignments_event_user_uq").on(t.eventTypeId, t.userId),
-        idxActive: index("team_assignments_active_idx").on(t.isActive),
-    })
+        uqEventUser: uniqueIndex("team_assignments_event_user_uq").on(
+            t.eventTypeId,
+            t.userId,
+        ),
+        idxActive: index("team_assignments_active_idx")
+            .on(t.isActive, t.weight)
+            .where(sql`${t.isActive} = true`),
+
+        chkWeight: sql`CHECK (${t.weight} > 0 AND ${t.weight} <= 100)`,
+        chkMaxPerDay: sql`CHECK (${t.maxBookingsPerDay} IS NULL OR ${t.maxBookingsPerDay} > 0)`,
+        chkMaxPerWeek: sql`CHECK (${t.maxBookingsPerWeek} IS NULL OR ${t.maxBookingsPerWeek} > 0)`,
+        chkMaxPerMonth: sql`CHECK (${t.maxBookingsPerMonth} IS NULL OR ${t.maxBookingsPerMonth} > 0)`,
+        chkTotals: sql`CHECK (${t.totalAssignments} >= 0 AND ${t.completedMeetings} >= 0 AND ${t.noShows} >= 0)`,
+        chkAverageRating: sql`CHECK (${t.averageRating} >= 0 AND ${t.averageRating} <= 5)`,
+    }),
 );
 
 /**
- * booking_analytics - Daily aggregates for scheduling performance
+ * Booking analytics - daily aggregates for performance
  */
 export const bookingAnalytics = pgTable(
     "booking_analytics",
     {
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        eventTypeId: text("event_type_id").notNull().references(() => eventTypes.id, { onDelete: "cascade" }),
-        userId: text("user_id").references(() => user.id, { onDelete: "cascade" }),
+        eventTypeId: text("event_type_id")
+            .notNull()
+            .references(() => eventTypes.id, { onDelete: "cascade" }),
+        userId: text("user_id").references(() => user.id, {
+            onDelete: "cascade",
+        }),
 
-        date: timestamp("date").notNull(),
+        date: timestamp("date", { mode: "date" }).notNull(),
 
-        // Core booking metrics
+        // Core metrics
         totalBookings: integer("total_bookings").notNull().default(0),
         confirmedBookings: integer("confirmed_bookings").notNull().default(0),
         completedMeetings: integer("completed_meetings").notNull().default(0),
@@ -570,33 +651,156 @@ export const bookingAnalytics = pgTable(
         noShows: integer("no_shows").notNull().default(0),
         rescheduledBookings: integer("rescheduled_bookings").notNull().default(0),
 
-        // SchedForm-specific metrics
-        averageQualificationScore: real("average_qualification_score").notNull().default(0),
+        // Quality metrics
+        averageQualificationScore: real("average_qualification_score")
+            .notNull()
+            .default(0),
         qualifiedBookings: integer("qualified_bookings").notNull().default(0),
-        highPriorityBookings: integer("high_priority_bookings").notNull().default(0),
+        highPriorityBookings: integer("high_priority_bookings")
+            .notNull()
+            .default(0),
         spamBookingsBlocked: integer("spam_bookings_blocked").notNull().default(0),
 
-        // Time and scheduling metrics
-        averageBookingLeadTime: integer("average_booking_lead_time").notNull().default(0), // hours in advance
-        averageBookingDuration: integer("average_booking_duration").notNull().default(0), // seconds to complete booking
-        peakBookingHour: integer("peak_booking_hour"), // Hour of day with most bookings
+        // Time metrics
+        averageBookingLeadTime: integer("average_booking_lead_time")
+            .notNull()
+            .default(0),
+        averageBookingDuration: integer("average_booking_duration")
+            .notNull()
+            .default(0),
+        peakBookingHour: integer("peak_booking_hour"),
 
-        // Conversion funnel
+        // Funnel metrics
         formViews: integer("form_views").notNull().default(0),
         formStarts: integer("form_starts").notNull().default(0),
         formCompletions: integer("form_completions").notNull().default(0),
-        schedulingPageViews: integer("scheduling_page_views").notNull().default(0),
+        schedulingPageViews: integer("scheduling_page_views")
+            .notNull()
+            .default(0),
 
         // Revenue tracking
         totalRevenue: real("total_revenue").notNull().default(0),
         averageBookingValue: real("average_booking_value").notNull().default(0),
 
-        createdAt: timestamp("created_at").notNull().defaultNow(),
+        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
     },
     (t) => ({
-        uqEventDate: uniqueIndex("booking_analytics_event_date_uq").on(t.eventTypeId, t.date),
-        idxUser: index("booking_analytics_user_idx").on(t.userId),
+        uqEventDate: uniqueIndex("booking_analytics_event_date_uq").on(
+            t.eventTypeId,
+            t.date,
+        ),
         idxDate: index("booking_analytics_date_idx").on(t.date),
+        idxUser: index("booking_analytics_user_idx")
+            .on(t.userId)
+            .where(sql`${t.userId} IS NOT NULL`),
+
+        chkTotals: sql`CHECK (${t.totalBookings} >= 0 AND ${t.confirmedBookings} >= 0 AND ${t.completedMeetings} >= 0 AND ${t.cancelledBookings} >= 0 AND ${t.noShows} >= 0 AND ${t.rescheduledBookings} >= 0)`,
+        chkAvgQual: sql`CHECK (${t.averageQualificationScore} >= 0 AND ${t.averageQualificationScore} <= 100)`,
+        chkQualifiedBookings: sql`CHECK (${t.qualifiedBookings} >= 0 AND ${t.highPriorityBookings} >= 0 AND ${t.spamBookingsBlocked} >= 0)`,
+        chkTimeMetrics: sql`CHECK (${t.averageBookingLeadTime} >= 0 AND ${t.averageBookingDuration} >= 0)`,
+        chkPeakHour: sql`CHECK (${t.peakBookingHour} IS NULL OR (${t.peakBookingHour} >= 0 AND ${t.peakBookingHour} <= 23))`,
+        chkFunnels: sql`CHECK (${t.formViews} >= 0 AND ${t.formStarts} >= 0 AND ${t.formCompletions} >= 0 AND ${t.schedulingPageViews} >= 0)`,
+        chkRevenue: sql`CHECK (${t.totalRevenue} >= 0 AND ${t.averageBookingValue} >= 0)`,
+    }),
+);
+
+/* ---------------- Booking Reminder Translations ---------------- */
+export const bookingReminderTranslations = pgTable(
+    "booking_reminder_translations",
+    {
+        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
+        reminderId: text("reminder_id").notNull().references(() => bookingReminders.id, { onDelete: "cascade" }),
+        languageCode: text("language_code").notNull().references(() => supportedLanguages.code, { onDelete: "restrict" }),
+
+        // Localized reminder content
+        subject: text("subject"),
+        message: text("message"),
+        customMessage: text("custom_message"),
+
+        // Localized template reference
+        reminderTemplate: text("reminder_template"), // Reference to localized template
+
+        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
+        updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
+    },
+    (t) => ({
+        uqReminderLanguage: uniqueIndex("booking_reminder_translations_reminder_language_uq").on(t.reminderId, t.languageCode),
+        idxLanguage: index("booking_reminder_translations_language_idx").on(t.languageCode),
+    })
+);
+
+/* ---------------- Localized Meeting Feedback ---------------- */
+export const meetingFeedbackTranslations = pgTable(
+    "meeting_feedback_translations",
+    {
+        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
+        feedbackId: text("feedback_id").notNull().references(() => meetingFeedback.id, { onDelete: "cascade" }),
+        languageCode: text("language_code").notNull().references(() => supportedLanguages.code, { onDelete: "restrict" }),
+
+        // Localized feedback content
+        notes: text("notes"),
+        nextSteps: text("next_steps"),
+        outcome: text("outcome"),
+
+        // AI-generated content in local language
+        aiMeetingSummary: text("ai_meeting_summary"),
+        aiNextStepsRecommendation: text("ai_next_steps_recommendation"),
+
+        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
+        updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
+    },
+    (t) => ({
+        uqFeedbackLanguage: uniqueIndex("meeting_feedback_translations_feedback_language_uq").on(t.feedbackId, t.languageCode),
+    })
+);
+
+/* ---------------- Localized Booking Status Messages ---------------- */
+export const bookingStatusMessages = pgTable(
+    "booking_status_messages",
+    {
+        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
+
+        statusKey: text("status_key").notNull(), // "confirmed", "cancelled", "no_show", etc.
+        languageCode: text("language_code").notNull().references(() => supportedLanguages.code, { onDelete: "restrict" }),
+
+        // Different message types for each status
+        emailSubject: text("email_subject"),
+        emailBody: text("email_body"),
+        smsMessage: text("sms_message"),
+        inAppMessage: text("in_app_message"),
+
+        // Context-specific variables
+        availableVariables: jsonb("available_variables"), // What variables can be used in this status
+
+        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
+        updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
+    },
+    (t) => ({
+        uqStatusLanguage: uniqueIndex("booking_status_messages_status_language_uq").on(t.statusKey, t.languageCode),
+        idxStatus: index("booking_status_messages_status_idx").on(t.statusKey),
+        idxLanguage: index("booking_status_messages_language_idx").on(t.languageCode),
+    })
+);
+
+/* ---------------- Time Zone Translation Helpers ---------------- */
+export const timezoneTranslations = pgTable(
+    "timezone_translations",
+    {
+        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
+
+        timezoneId: text("timezone_id").notNull(), // "America/New_York", "Europe/London", etc.
+        languageCode: text("language_code").notNull().references(() => supportedLanguages.code, { onDelete: "restrict" }),
+
+        displayName: text("display_name").notNull(), // "Eastern Standard Time", "Hora del Este", etc.
+        shortName: text("short_name"), // "EST", "GMT", etc.
+        description: text("description"), // Human-friendly description
+
+        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
+    },
+    (t) => ({
+        uqTimezoneLanguage: uniqueIndex("timezone_translations_timezone_language_uq").on(t.timezoneId, t.languageCode),
+        idxTimezone: index("timezone_translations_timezone_idx").on(t.timezoneId),
+        idxLanguage: index("timezone_translations_language_idx").on(t.languageCode),
     })
 );
 
@@ -619,6 +823,11 @@ export const eventTypesRelations = relations(eventTypes, ({ one, many }) => ({
     bookings: many(bookings),
     analytics: many(bookingAnalytics),
     availabilityRules: many(availabilityRules),
+    translations: many(eventTypeTranslations),
+    defaultLanguageRef: one(supportedLanguages, {
+        fields: [eventTypes.defaultLanguage],
+        references: [supportedLanguages.code],
+    }),
 }));
 
 export const availabilitySlotsRelations = relations(availabilitySlots, ({ one }) => ({
@@ -656,14 +865,24 @@ export const bookingsRelations = relations(bookings, ({ one, many }) => ({
         fields: [bookings.originalBookingId],
         references: [bookings.id],
     }),
+    detectedLanguageRef: one(supportedLanguages, {
+        fields: [bookings.detectedLanguage],
+        references: [supportedLanguages.code],
+    }),
+    preferredLanguageRef: one(supportedLanguages, {
+        fields: [bookings.preferredLanguage],
+        references: [supportedLanguages.code],
+    }),
 }));
 
-export const bookingRemindersRelations = relations(bookingReminders, ({ one }) => ({
+export const bookingRemindersRelations = relations(bookingReminders, ({ one, many }) => ({
     booking: one(bookings, { fields: [bookingReminders.bookingId], references: [bookings.id] }),
+    translations: many(bookingReminderTranslations),
 }));
 
-export const meetingFeedbackRelations = relations(meetingFeedback, ({ one }) => ({
+export const meetingFeedbackRelations = relations(meetingFeedback, ({ one, many }) => ({
     booking: one(bookings, { fields: [meetingFeedback.bookingId], references: [bookings.id] }),
+    translations: many(meetingFeedbackTranslations),
 }));
 
 export const teamAssignmentsRelations = relations(teamAssignments, ({ one }) => ({
@@ -674,4 +893,40 @@ export const teamAssignmentsRelations = relations(teamAssignments, ({ one }) => 
 export const bookingAnalyticsRelations = relations(bookingAnalytics, ({ one }) => ({
     eventType: one(eventTypes, { fields: [bookingAnalytics.eventTypeId], references: [eventTypes.id] }),
     user: one(user, { fields: [bookingAnalytics.userId], references: [user.id] }),
+}));
+
+export const bookingReminderTranslationsRelations = relations(bookingReminderTranslations, ({ one }) => ({
+    reminder: one(bookingReminders, {
+        fields: [bookingReminderTranslations.reminderId],
+        references: [bookingReminders.id]
+    }),
+    language: one(supportedLanguages, {
+        fields: [bookingReminderTranslations.languageCode],
+        references: [supportedLanguages.code]
+    }),
+}));
+
+export const meetingFeedbackTranslationsRelations = relations(meetingFeedbackTranslations, ({ one }) => ({
+    feedback: one(meetingFeedback, {
+        fields: [meetingFeedbackTranslations.feedbackId],
+        references: [meetingFeedback.id]
+    }),
+    language: one(supportedLanguages, {
+        fields: [meetingFeedbackTranslations.languageCode],
+        references: [supportedLanguages.code]
+    }),
+}));
+
+export const bookingStatusMessagesRelations = relations(bookingStatusMessages, ({ one }) => ({
+    language: one(supportedLanguages, {
+        fields: [bookingStatusMessages.languageCode],
+        references: [supportedLanguages.code]
+    }),
+}));
+
+export const timezoneTranslationsRelations = relations(timezoneTranslations, ({ one }) => ({
+    language: one(supportedLanguages, {
+        fields: [timezoneTranslations.languageCode],
+        references: [supportedLanguages.code]
+    }),
 }));

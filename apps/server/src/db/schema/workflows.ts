@@ -12,10 +12,11 @@ import {
     uniqueIndex,
 } from "drizzle-orm/pg-core";
 import { relations } from "drizzle-orm";
+import {user} from "@/db/schema/auth";
+import {forms} from "@/db/schema/forms";
+import {eventTypes} from "@/db/schema/scheduling";
+import {supportedLanguages} from "@/db/schema/localization";
 
-import { user } from "./auth";
-import { forms } from "./forms";
-import { eventTypes } from "./scheduling";
 
 /* ---------------- Enums ---------------- */
 export const triggerTypeEnum = pgEnum("trigger_type", [
@@ -309,6 +310,10 @@ export const emailTemplates = pgTable(
         htmlBody: text("html_body").notNull(),
         textBody: text("text_body"),
 
+        defaultLanguage: varchar("default_language", { length: 10 }).references(() => supportedLanguages.code, { onDelete: "set null" }),
+        supportedLanguages: jsonb("supported_languages"), // Array of language codes
+        autoDetectLanguage: boolean("auto_detect_language").default(true),
+
         variables: jsonb("variables"),
 
         isDefault: boolean("is_default").default(false),
@@ -347,6 +352,10 @@ export const smsTemplates = pgTable(
 
         message: varchar("message", { length: 1000 }).notNull(),
         variables: jsonb("variables"),
+
+        defaultLanguage: varchar("default_language", { length: 10 }).references(() => supportedLanguages.code, { onDelete: "set null" }),
+        supportedLanguages: jsonb("supported_languages"),
+        autoDetectLanguage: boolean("auto_detect_language").default(true),
 
         isDefault: boolean("is_default").default(false),
         isActive: boolean("is_active").default(true),
@@ -485,6 +494,107 @@ export const automationRules = pgTable(
     }),
 );
 
+/* ---------------- Email Template Translations ---------------- */
+export const emailTemplateTranslations = pgTable(
+    "email_template_translations",
+    {
+        id: varchar("id", { length: 36 }).primaryKey().$defaultFn(() => crypto.randomUUID()),
+        templateId: varchar("template_id", { length: 36 }).notNull().references(() => emailTemplates.id, { onDelete: "cascade" }),
+        languageCode: text("language_code").notNull().references(() => supportedLanguages.code, { onDelete: "restrict" }),
+
+        subject: varchar("subject", { length: 255 }),
+        htmlBody: text("html_body"),
+        textBody: text("text_body"),
+
+        // Localized variables and their descriptions
+        localizedVariables: jsonb("localized_variables"), // Variable names and descriptions in this language
+
+        status: text("status").notNull().default("draft"), // draft, published, archived
+        translatedBy: varchar("translated_by", { length: 36 }).references(() => user.id, { onDelete: "set null" }),
+        reviewedBy: varchar("reviewed_by", { length: 36 }).references(() => user.id, { onDelete: "set null" }),
+
+        createdAt: timestamp("created_at").notNull().defaultNow(),
+        updatedAt: timestamp("updated_at").notNull().defaultNow(),
+    },
+    (t) => ({
+        uqTemplateLanguage: uniqueIndex("email_template_translations_template_language_uq").on(t.templateId, t.languageCode),
+        idxLanguage: index("email_template_translations_language_idx").on(t.languageCode),
+        idxStatus: index("email_template_translations_status_idx").on(t.status),
+    })
+);
+
+/* ---------------- SMS Template Translations ---------------- */
+export const smsTemplateTranslations = pgTable(
+    "sms_template_translations",
+    {
+        id: varchar("id", { length: 36 }).primaryKey().$defaultFn(() => crypto.randomUUID()),
+        templateId: varchar("template_id", { length: 36 }).notNull().references(() => smsTemplates.id, { onDelete: "cascade" }),
+        languageCode: text("language_code").notNull().references(() => supportedLanguages.code, { onDelete: "restrict" }),
+
+        message: varchar("message", { length: 1000 }),
+        localizedVariables: jsonb("localized_variables"),
+
+        status: text("status").notNull().default("draft"),
+        translatedBy: varchar("translated_by", { length: 36 }).references(() => user.id, { onDelete: "set null" }),
+        reviewedBy: varchar("reviewed_by", { length: 36 }).references(() => user.id, { onDelete: "set null" }),
+
+        createdAt: timestamp("created_at").notNull().defaultNow(),
+        updatedAt: timestamp("updated_at").notNull().defaultNow(),
+    },
+    (t) => ({
+        uqTemplateLanguage: uniqueIndex("sms_template_translations_template_language_uq").on(t.templateId, t.languageCode),
+        idxLanguage: index("sms_template_translations_language_idx").on(t.languageCode),
+    })
+);
+
+/* ---------------- Automation Rule Translations ---------------- */
+export const automationRuleTranslations = pgTable(
+    "automation_rule_translations",
+    {
+        id: varchar("id", { length: 36 }).primaryKey().$defaultFn(() => crypto.randomUUID()),
+        ruleId: varchar("rule_id", { length: 36 }).notNull().references(() => automationRules.id, { onDelete: "cascade" }),
+        languageCode: text("language_code").notNull().references(() => supportedLanguages.code, { onDelete: "restrict" }),
+
+        name: varchar("name", { length: 255 }),
+        description: text("description"),
+
+        // Localized actions (e.g., notification messages, email content)
+        localizedActions: jsonb("localized_actions"),
+
+        createdAt: timestamp("created_at").notNull().defaultNow(),
+        updatedAt: timestamp("updated_at").notNull().defaultNow(),
+    },
+    (t) => ({
+        uqRuleLanguage: uniqueIndex("automation_rule_translations_rule_language_uq").on(t.ruleId, t.languageCode),
+    })
+);
+
+/* ---------------- Localized Notification Queue ---------------- */
+export const localizedNotificationQueue = pgTable(
+    "localized_notification_queue",
+    {
+        id: varchar("id", { length: 36 }).primaryKey().$defaultFn(() => crypto.randomUUID()),
+        notificationId: varchar("notification_id", { length: 36 }).notNull().references(() => notificationQueue.id, { onDelete: "cascade" }),
+
+        languageCode: text("language_code").notNull().references(() => supportedLanguages.code, { onDelete: "restrict" }),
+
+        // Localized content
+        localizedSubject: varchar("localized_subject", { length: 255 }),
+        localizedMessage: text("localized_message"),
+        localizedTemplateData: jsonb("localized_template_data"),
+
+        // Regional delivery preferences
+        timezoneAdjusted: boolean("timezone_adjusted").default(true),
+        culturalSensitivityCheck: boolean("cultural_sensitivity_check").default(false),
+
+        createdAt: timestamp("created_at").notNull().defaultNow(),
+    },
+    (t) => ({
+        uqNotificationLanguage: uniqueIndex("localized_notification_queue_notification_language_uq").on(t.notificationId, t.languageCode),
+        idxLanguage: index("localized_notification_queue_language_idx").on(t.languageCode),
+    })
+);
+
 /* ---------------- Relations (Grouped at Bottom) ---------------- */
 export const workflowsRelations = relations(workflows, ({ one, many }) => ({
     owner: one(user, { fields: [workflows.userId], references: [user.id] }),
@@ -530,12 +640,22 @@ export const webhookDeliveriesRelations = relations(
     }),
 );
 
-export const emailTemplatesRelations = relations(emailTemplates, ({ one }) => ({
+export const emailTemplatesRelations = relations(emailTemplates, ({ one, many }) => ({
     owner: one(user, { fields: [emailTemplates.userId], references: [user.id] }),
+    translations: many(emailTemplateTranslations),
+    defaultLanguageRef: one(supportedLanguages, {
+        fields: [emailTemplates.defaultLanguage],
+        references: [supportedLanguages.code],
+    }),
 }));
 
-export const smsTemplatesRelations = relations(smsTemplates, ({ one }) => ({
+export const smsTemplatesRelations = relations(smsTemplates, ({ one, many }) => ({
     owner: one(user, { fields: [smsTemplates.userId], references: [user.id] }),
+    translations: many(smsTemplateTranslations),
+    defaultLanguageRef: one(supportedLanguages, {
+        fields: [smsTemplates.defaultLanguage],
+        references: [supportedLanguages.code],
+    }),
 }));
 
 export const notificationQueueRelations = relations(
@@ -563,3 +683,63 @@ export const automationRulesRelations = relations(
         }),
     }),
 );
+
+export const emailTemplateTranslationsRelations = relations(emailTemplateTranslations, ({ one }) => ({
+    template: one(emailTemplates, {
+        fields: [emailTemplateTranslations.templateId],
+        references: [emailTemplates.id]
+    }),
+    language: one(supportedLanguages, {
+        fields: [emailTemplateTranslations.languageCode],
+        references: [supportedLanguages.code]
+    }),
+    translator: one(user, {
+        fields: [emailTemplateTranslations.translatedBy],
+        references: [user.id]
+    }),
+    reviewer: one(user, {
+        fields: [emailTemplateTranslations.reviewedBy],
+        references: [user.id]
+    }),
+}));
+
+export const smsTemplateTranslationsRelations = relations(smsTemplateTranslations, ({ one }) => ({
+    template: one(smsTemplates, {
+        fields: [smsTemplateTranslations.templateId],
+        references: [smsTemplates.id]
+    }),
+    language: one(supportedLanguages, {
+        fields: [smsTemplateTranslations.languageCode],
+        references: [supportedLanguages.code]
+    }),
+    translator: one(user, {
+        fields: [smsTemplateTranslations.translatedBy],
+        references: [user.id]
+    }),
+    reviewer: one(user, {
+        fields: [smsTemplateTranslations.reviewedBy],
+        references: [user.id]
+    }),
+}));
+
+export const automationRuleTranslationsRelations = relations(automationRuleTranslations, ({ one }) => ({
+    rule: one(automationRules, {
+        fields: [automationRuleTranslations.ruleId],
+        references: [automationRules.id]
+    }),
+    language: one(supportedLanguages, {
+        fields: [automationRuleTranslations.languageCode],
+        references: [supportedLanguages.code]
+    }),
+}));
+
+export const localizedNotificationQueueRelations = relations(localizedNotificationQueue, ({ one }) => ({
+    notification: one(notificationQueue, {
+        fields: [localizedNotificationQueue.notificationId],
+        references: [notificationQueue.id]
+    }),
+    language: one(supportedLanguages, {
+        fields: [localizedNotificationQueue.languageCode],
+        references: [supportedLanguages.code]
+    }),
+}));

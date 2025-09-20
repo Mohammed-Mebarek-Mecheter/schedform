@@ -18,8 +18,11 @@ export * from "./spamPrevention";
 // Comprehensive white-labeling support
 export * from "./whiteLabeling";
 
-// Workflows and automation (existing)
+// Workflows and automation
 export * from "./workflows";
 
-// Business features (existing)
+// Business features
 export * from "./business";
+
+// Localization
+export * from "./localization";

@@ -11,12 +11,11 @@ import {
     uniqueIndex,
     real,
 } from "drizzle-orm/pg-core";
-import { relations } from "drizzle-orm";
-import { user } from "./auth";
+import { relations, sql } from "drizzle-orm";
+import { user } from "@/db/schema/auth";
+import {supportedLanguages} from "@/db/schema/localization";
 
-/**
- * Enums
- */
+/* ---------------- Enums ---------------- */
 export const questionTypeEnum = pgEnum("question_type", [
     "short_text",
     "long_text",
@@ -34,9 +33,9 @@ export const questionTypeEnum = pgEnum("question_type", [
     "website_url",
     "linear_scale",
     "opinion_scale",
-    "meeting_preference", // New: for scheduling preferences
-    "availability_check", // New: to check general availability
-    "urgency_level", // New: to gauge booking urgency
+    "meeting_preference",
+    "availability_check",
+    "urgency_level",
 ]);
 
 export const formStatusEnum = pgEnum("form_status", [
@@ -57,44 +56,37 @@ export const logicOperatorEnum = pgEnum("logic_operator", [
     "is_not_empty",
 ]);
 
-// New enum for form types
 export const formTypeEnum = pgEnum("form_type", [
-    "qualification_only", // Traditional form without scheduling
-    "conversational_scheduling", // SchedForm's core offering
-    "booking_with_intake", // Scheduling with detailed intake
+    "qualification_only",
+    "conversational_scheduling",
+    "booking_with_intake",
 ]);
 
-/**
- * Forms - Enhanced for SchedForm's integrated approach
- */
+/* ---------------- Forms ---------------- */
 export const forms = pgTable(
     "forms",
     {
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        userId: text("user_id")
-            .notNull()
-            .references(() => user.id, { onDelete: "cascade" }),
+        userId: text("user_id").notNull().references(() => user.id, { onDelete: "restrict" }),
 
         // Basic info
         title: text("title").notNull(),
         description: text("description"),
         slug: text("slug").notNull(),
 
-        // SchedForm-specific: Form type determines behavior
+        // Type & lifecycle
         formType: formTypeEnum("form_type").notNull().default("conversational_scheduling"),
-
-        // Lifecycle & status
         status: formStatusEnum("status").notNull().default("draft"),
-        publishedAt: timestamp("published_at"),
+        publishedAt: timestamp("published_at", { mode: "date" }),
 
-        // White-labeling (comprehensive support)
+        // White-labeling & branding
         customBranding: boolean("custom_branding").notNull().default(false),
         logoUrl: text("logo_url"),
         primaryColor: text("primary_color").notNull().default("#3b82f6"),
         backgroundColor: text("background_color").notNull().default("#ffffff"),
         customCss: text("custom_css"),
         customJs: text("custom_js"),
-        brandingConfig: jsonb("branding_config"), // Centralized branding settings
+        brandingConfig: jsonb("branding_config"),
 
         // Behavior
         showProgressBar: boolean("show_progress_bar").notNull().default(true),
@@ -110,330 +102,321 @@ export const forms = pgTable(
         allowMultipleSubmissions: boolean("allow_multiple_submissions").notNull().default(false),
 
         // Closing
-        closingDate: timestamp("closing_date"),
+        closingDate: timestamp("closing_date", { mode: "date" }),
         closingMessage: text("closing_message"),
 
-        // Enhanced analytics counters
+        // Analytics counters
         totalViews: integer("total_views").notNull().default(0),
-        totalStarts: integer("total_starts").notNull().default(0), // New: better funnel tracking
+        totalStarts: integer("total_starts").notNull().default(0),
         totalResponses: integer("total_responses").notNull().default(0),
-        totalQualifiedResponses: integer("total_qualified_responses").notNull().default(0), // New: qualified responses
+        totalQualifiedResponses: integer("total_qualified_responses").notNull().default(0),
         completionRate: real("completion_rate").notNull().default(0),
-        qualificationRate: real("qualification_rate").notNull().default(0), // New: qualification success rate
+        qualificationRate: real("qualification_rate").notNull().default(0),
 
         // AI & Intelligence settings
         enableAiAnalysis: boolean("enable_ai_analysis").notNull().default(true),
-        aiPromptTemplate: text("ai_prompt_template"), // Custom AI analysis prompt
-        qualificationCriteria: jsonb("qualification_criteria"), // Scoring criteria
+        aiPromptTemplate: text("ai_prompt_template"),
+        qualificationCriteria: jsonb("qualification_criteria"),
 
-        // Spam prevention settings
+        // Spam prevention
         enableSpamProtection: boolean("enable_spam_protection").notNull().default(true),
         requireEmailVerification: boolean("require_email_verification").notNull().default(true),
         requirePhoneVerification: boolean("require_phone_verification").notNull().default(false),
-        spamProtectionConfig: jsonb("spam_protection_config"), // Detailed spam settings
+        spamProtectionConfig: jsonb("spam_protection_config"),
+
+        defaultLanguage: text("default_language").references(() => supportedLanguages.code, { onDelete: "set null" }),
+        availableLanguages: jsonb("available_languages"), // Array of language codes
+        autoDetectLanguage: boolean("auto_detect_language").notNull().default(true),
 
         // Timestamps
-        createdAt: timestamp("created_at").notNull().defaultNow(),
-        updatedAt: timestamp("updated_at").notNull().defaultNow(),
+        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
+        updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
     },
     (t) => ({
+        // Indexes & unique constraints
         uniqueSlug: uniqueIndex("forms_slug_unique").on(t.slug),
-        idxUser: index("forms_user_idx").on(t.userId),
-        idxType: index("forms_type_idx").on(t.formType),
-        idxStatus: index("forms_status_idx").on(t.status),
+        idxUserStatus: index("forms_user_status_idx").on(t.userId, t.status),
+        idxPublishedActive: index("forms_published_active_idx").on(t.publishedAt).where(sql`${t.status} = 'published'`),
+
+        // CHECK constraints (moved here to avoid self-reference issues)
+        ck_logo_url: sql`CHECK (${t.logoUrl} IS NULL OR ${t.logoUrl} ~ '^https?://')`,
+        ck_primary_color: sql`CHECK (${t.primaryColor} ~ '^#[0-9A-Fa-f]{6}$')`,
+        ck_background_color: sql`CHECK (${t.backgroundColor} ~ '^#[0-9A-Fa-f]{6}$')`,
+        ck_redirect_url: sql`CHECK (${t.redirectUrl} IS NULL OR ${t.redirectUrl} ~ '^https?://')`,
+        ck_max_responses: sql`CHECK (${t.maxResponses} IS NULL OR ${t.maxResponses} > 0)`,
+
+        ck_total_views: sql`CHECK (${t.totalViews} >= 0)`,
+        ck_total_starts: sql`CHECK (${t.totalStarts} >= 0)`,
+        ck_total_responses: sql`CHECK (${t.totalResponses} >= 0)`,
+        ck_total_qualified_responses: sql`CHECK (${t.totalQualifiedResponses} >= 0)`,
+        ck_completion_rate: sql`CHECK (${t.completionRate} >= 0 AND ${t.completionRate} <= 100)`,
+        ck_qualification_rate: sql`CHECK (${t.qualificationRate} >= 0 AND ${t.qualificationRate} <= 100)`,
     })
 );
 
-/**
- * Form Questions - Enhanced with scheduling-specific types
- */
+/* ---------------- Form Questions ---------------- */
 export const formQuestions = pgTable(
     "form_questions",
     {
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        formId: text("form_id")
-            .notNull()
-            .references(() => forms.id, { onDelete: "cascade" }),
+        formId: text("form_id").notNull().references(() => forms.id, { onDelete: "cascade" }),
 
         title: text("title").notNull(),
         description: text("description"),
         type: questionTypeEnum("type").notNull(),
         isRequired: boolean("is_required").notNull().default(false),
 
-        // Ordering & grouping
         orderIndex: integer("order_index").notNull().default(0),
         groupId: text("group_id"),
 
-        // Enhanced settings with scheduling context
         settings: jsonb("settings"),
+        qualificationWeight: real("qualification_weight").notNull().default(1.0),
+        aiAnalysisPrompt: text("ai_analysis_prompt"),
 
-        // AI qualification impact
-        qualificationWeight: real("qualification_weight").notNull().default(1.0), // How much this question affects qualification
-        aiAnalysisPrompt: text("ai_analysis_prompt"), // Specific AI prompt for this question
+        affectsScheduling: boolean("affects_scheduling").notNull().default(false),
+        schedulingContext: jsonb("scheduling_context"),
 
-        // Scheduling relevance
-        affectsScheduling: boolean("affects_scheduling").notNull().default(false), // Does this impact meeting scheduling?
-        schedulingContext: jsonb("scheduling_context"), // How this relates to scheduling
-
-        // File-specific
         maxFileSize: integer("max_file_size"),
         allowedFileTypes: text("allowed_file_types"),
 
-        // Enhanced validation and logic
         validationRules: jsonb("validation_rules"),
         showConditions: jsonb("show_conditions"),
-        skipConditions: jsonb("skip_conditions"), // New: conditions to skip this question
+        skipConditions: jsonb("skip_conditions"),
 
-        createdAt: timestamp("created_at").notNull().defaultNow(),
-        updatedAt: timestamp("updated_at").notNull().defaultNow(),
+        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
+        updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
     },
     (t) => ({
-        idxFormQuestions: index("form_questions_form_idx").on(t.formId, t.orderIndex),
-        idxScheduling: index("form_questions_scheduling_idx").on(t.affectsScheduling),
+        idxFormOrder: index("form_questions_form_order_idx").on(t.formId, t.orderIndex),
+        uqFormOrder: uniqueIndex("form_questions_form_order_uq").on(t.formId, t.orderIndex),
+
+        // checks
+        ck_order_index_nonnegative: sql`CHECK (${t.orderIndex} >= 0)`,
+        ck_qualification_weight_range: sql`CHECK (${t.qualificationWeight} >= 0 AND ${t.qualificationWeight} <= 10)`,
+        ck_max_file_size_null_or_positive: sql`CHECK (${t.maxFileSize} IS NULL OR ${t.maxFileSize} > 0)`,
     })
 );
 
-/**
- * Question Choices - Enhanced with scheduling implications
- */
+/* ---------------- Question Choices ---------------- */
 export const questionChoices = pgTable(
     "question_choices",
     {
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        questionId: text("question_id")
-            .notNull()
-            .references(() => formQuestions.id, { onDelete: "cascade" }),
+        questionId: text("question_id").notNull().references(() => formQuestions.id, { onDelete: "cascade" }),
 
         label: text("label").notNull(),
         value: text("value").notNull(),
         orderIndex: integer("order_index").notNull().default(0),
         isDefault: boolean("is_default").notNull().default(false),
 
-        // Enhanced branching and qualification
-        jumpToQuestionId: text("jump_to_question_id").references(() => formQuestions.id, {
-            onDelete: "set null",
-        }),
-        qualificationScore: real("qualification_score").notNull().default(0), // How this choice affects qualification
-        schedulingImpact: jsonb("scheduling_impact"), // How this choice affects scheduling (duration, urgency, etc.)
+        jumpToQuestionId: text("jump_to_question_id").references(() => formQuestions.id, { onDelete: "set null" }),
+        qualificationScore: real("qualification_score").notNull().default(0),
+        schedulingImpact: jsonb("scheduling_impact"),
 
-        // Disqualification logic
         isDisqualifying: boolean("is_disqualifying").notNull().default(false),
         disqualificationMessage: text("disqualification_message"),
 
-        createdAt: timestamp("created_at").notNull().defaultNow(),
+        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
     },
     (t) => ({
-        uqChoiceValue: uniqueIndex("question_choices_question_value_uq").on(t.questionId, t.value),
-        uqChoiceOrder: uniqueIndex("question_choices_question_order_uq").on(t.questionId, t.orderIndex),
+        uqQuestionOrder: uniqueIndex("question_choices_question_order_uq").on(t.questionId, t.orderIndex),
+        idxQuestion: index("question_choices_question_idx").on(t.questionId),
+
+        ck_order_index_nonnegative: sql`CHECK (${t.orderIndex} >= 0)`,
+        ck_qualification_score_range: sql`CHECK (${t.qualificationScore} >= -100 AND ${t.qualificationScore} <= 100)`,
     })
 );
 
-/**
- * Form Responses - Enhanced with qualification and scheduling context
- */
+/* ---------------- Form Responses ---------------- */
 export const formResponses = pgTable(
     "form_responses",
     {
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        formId: text("form_id")
-            .notNull()
-            .references(() => forms.id, { onDelete: "cascade" }),
+        formId: text("form_id").notNull().references(() => forms.id, { onDelete: "restrict" }),
 
-        // Respondent info
         respondentUserId: text("respondent_user_id").references(() => user.id, { onDelete: "set null" }),
         respondentId: text("respondent_id"),
         respondentEmail: text("respondent_email"),
         respondentName: text("respondent_name"),
         respondentPhone: text("respondent_phone"),
 
-        // Technical metadata
         ipAddress: text("ip_address"),
         userAgent: text("user_agent"),
         sessionId: text("session_id"),
 
-        // Enhanced progress tracking
         isCompleted: boolean("is_completed").notNull().default(false),
-        completedAt: timestamp("completed_at"),
+        completedAt: timestamp("completed_at", { mode: "date" }),
         timeToComplete: integer("time_to_complete"),
 
-        // Resume functionality
         resumeToken: text("resume_token"),
         lastQuestionId: text("last_question_id").references(() => formQuestions.id, { onDelete: "set null" }),
 
-        // Location tracking
         country: text("country"),
         city: text("city"),
-        timezone: text("timezone"), // New: important for scheduling
+        timezone: text("timezone"),
 
-        // Enhanced AI analysis and qualification
-        qualityScore: integer("quality_score"), // 0-100
-        spamScore: integer("spam_score"), // 0-100
-        qualificationScore: real("qualification_score"), // 0-100, core SchedForm metric
-        intentScore: integer("intent_score"), // 0-100, urgency/seriousness of intent
+        qualityScore: integer("quality_score"),
+        spamScore: integer("spam_score"),
+        qualificationScore: real("qualification_score"),
+        intentScore: integer("intent_score"),
 
-        // AI-generated insights
-        aiSummary: text("ai_summary"), // AI-generated summary of the response
-        aiRecommendations: jsonb("ai_recommendations"), // AI suggestions for handling this prospect
-        qualificationReasons: jsonb("qualification_reasons"), // Why was this scored as qualified/unqualified
+        aiSummary: text("ai_summary"),
+        aiRecommendations: jsonb("ai_recommendations"),
+        qualificationReasons: jsonb("qualification_reasons"),
 
-        // Scheduling preferences extracted from responses
-        preferredMeetingType: text("preferred_meeting_type"), // phone, video, in-person
-        urgencyLevel: text("urgency_level"), // high, medium, low
-        estimatedDuration: integer("estimated_duration"), // minutes, AI-estimated optimal meeting duration
-        preferredTimeframe: jsonb("preferred_timeframe"), // When they prefer to meet
+        preferredMeetingType: text("preferred_meeting_type"),
+        urgencyLevel: text("urgency_level"),
+        estimatedDuration: integer("estimated_duration"),
+        preferredTimeframe: jsonb("preferred_timeframe"),
 
-        // Verification status
         emailVerified: boolean("email_verified").notNull().default(false),
-        emailVerifiedAt: timestamp("email_verified_at"),
+        emailVerifiedAt: timestamp("email_verified_at", { mode: "date" }),
         phoneVerified: boolean("phone_verified").notNull().default(false),
-        phoneVerifiedAt: timestamp("phone_verified_at"),
+        phoneVerifiedAt: timestamp("phone_verified_at", { mode: "date" }),
 
-        // Anti-spam tracking
-        spamFlags: jsonb("spam_flags"), // Specific spam indicators detected
-        spamPreventionActions: jsonb("spam_prevention_actions"), // Actions taken to prevent spam
+        spamFlags: jsonb("spam_flags"),
+        spamPreventionActions: jsonb("spam_prevention_actions"),
         manualReview: boolean("manual_review").notNull().default(false),
-        reviewedAt: timestamp("reviewed_at"),
+        reviewedAt: timestamp("reviewed_at", { mode: "date" }),
         reviewedBy: text("reviewed_by").references(() => user.id, { onDelete: "set null" }),
 
-        createdAt: timestamp("created_at").notNull().defaultNow(),
-        updatedAt: timestamp("updated_at").notNull().defaultNow(),
+        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
+        updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
     },
     (t) => ({
-        idxFormCompleted: index("form_responses_form_completed_idx").on(t.formId, t.isCompleted),
-        uqResumeToken: uniqueIndex("form_responses_resume_token_uq").on(t.resumeToken),
-        idxRespondentUser: index("form_responses_respondent_user_idx").on(t.respondentUserId),
-        idxQualification: index("form_responses_qualification_idx").on(t.qualificationScore),
-        idxSpam: index("form_responses_spam_idx").on(t.spamScore),
-        idxIntent: index("form_responses_intent_idx").on(t.intentScore),
-        idxEmailPhone: index("form_responses_email_phone_idx").on(t.respondentEmail, t.respondentPhone),
+        idxFormCreated: index("form_responses_form_created_idx").on(t.formId, t.createdAt),
+        idxCompleted: index("form_responses_completed_idx").on(t.isCompleted, t.completedAt).where(sql`${t.isCompleted} = true`),
+        uqResumeToken: uniqueIndex("form_responses_resume_token_uq").on(t.resumeToken).where(sql`${t.resumeToken} IS NOT NULL`),
+        idxEmail: index("form_responses_email_idx").on(t.respondentEmail).where(sql`${t.respondentEmail} IS NOT NULL`),
+
+        // checks
+        ck_time_to_complete_null_or_positive: sql`CHECK (${t.timeToComplete} IS NULL OR ${t.timeToComplete} > 0)`,
+        ck_quality_score_range: sql`CHECK (${t.qualityScore} IS NULL OR (${t.qualityScore} >= 0 AND ${t.qualityScore} <= 100))`,
+        ck_spam_score_range: sql`CHECK (${t.spamScore} IS NULL OR (${t.spamScore} >= 0 AND ${t.spamScore} <= 100))`,
+        ck_qualification_score_range: sql`CHECK (${t.qualificationScore} IS NULL OR (${t.qualificationScore} >= 0 AND ${t.qualificationScore} <= 100))`,
+        ck_intent_score_range: sql`CHECK (${t.intentScore} IS NULL OR (${t.intentScore} >= 0 AND ${t.intentScore} <= 100))`,
+        ck_estimated_duration_null_or_positive: sql`CHECK (${t.estimatedDuration} IS NULL OR ${t.estimatedDuration} > 0)`,
+        ck_respondent_email_format: sql`CHECK (${t.respondentEmail} IS NULL OR ${t.respondentEmail} ~ '^[^@]+@[^@]+\\.[^@]+$')`,
     })
 );
 
-/**
- * Form Answers - Enhanced with qualification context
- */
+/* ---------------- Form Answers ---------------- */
 export const formAnswers = pgTable(
     "form_answers",
     {
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        responseId: text("response_id")
-            .notNull()
-            .references(() => formResponses.id, { onDelete: "cascade" }),
-        questionId: text("question_id")
-            .notNull()
-            .references(() => formQuestions.id, { onDelete: "cascade" }),
+        responseId: text("response_id").notNull().references(() => formResponses.id, { onDelete: "cascade" }),
+        questionId: text("question_id").notNull().references(() => formQuestions.id, { onDelete: "restrict" }),
 
-        // Various typed columns
         textValue: text("text_value"),
         numberValue: integer("number_value"),
-        dateValue: timestamp("date_value"),
+        dateValue: timestamp("date_value", { mode: "date" }),
         booleanValue: boolean("boolean_value"),
         jsonValue: jsonb("json_value"),
 
-        // File metadata
         fileUrl: text("file_url"),
         fileName: text("file_name"),
         fileSize: integer("file_size"),
         fileMimeType: text("file_mime_type"),
 
-        // Enhanced qualification tracking
-        qualificationContribution: real("qualification_contribution"), // How this answer contributed to overall score
-        aiAnalysis: text("ai_analysis"), // AI analysis of this specific answer
-        extractedInsights: jsonb("extracted_insights"), // Structured insights from this answer
+        qualificationContribution: real("qualification_contribution"),
+        aiAnalysis: text("ai_analysis"),
+        extractedInsights: jsonb("extracted_insights"),
 
-        createdAt: timestamp("created_at").notNull().defaultNow(),
-        updatedAt: timestamp("updated_at").notNull().defaultNow(),
+        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
+        updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
     },
     (t) => ({
         uqResponseQuestion: uniqueIndex("form_answers_response_question_uq").on(t.responseId, t.questionId),
-        idxQuestion: index("form_answers_question_idx").on(t.questionId),
+        idxResponse: index("form_answers_response_idx").on(t.responseId),
+
+        ck_file_url_format: sql`CHECK (${t.fileUrl} IS NULL OR ${t.fileUrl} ~ '^https?://')`,
+        ck_file_size_null_or_positive: sql`CHECK (${t.fileSize} IS NULL OR ${t.fileSize} > 0)`,
     })
 );
 
-/**
- * Form Analytics - Enhanced for SchedForm metrics
- */
+/* ---------------- Form Analytics ---------------- */
 export const formAnalytics = pgTable(
     "form_analytics",
     {
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        formId: text("form_id")
-            .notNull()
-            .references(() => forms.id, { onDelete: "cascade" }),
+        formId: text("form_id").notNull().references(() => forms.id, { onDelete: "cascade" }),
 
-        date: timestamp("date").notNull(),
+        date: timestamp("date", { mode: "date" }).notNull(),
         views: integer("views").notNull().default(0),
         starts: integer("starts").notNull().default(0),
         completions: integer("completions").notNull().default(0),
 
-        // SchedForm-specific metrics
         qualifiedLeads: integer("qualified_leads").notNull().default(0),
         bookingRequests: integer("booking_requests").notNull().default(0),
         successfulBookings: integer("successful_bookings").notNull().default(0),
         spamBlocked: integer("spam_blocked").notNull().default(0),
 
-        // Quality metrics
         averageQualificationScore: real("average_qualification_score").notNull().default(0),
         averageIntentScore: real("average_intent_score").notNull().default(0),
         averageTimeToComplete: integer("average_time_to_complete").notNull().default(0),
 
-        // Detailed breakdowns
         questionDropoffs: jsonb("question_dropoffs"),
         deviceStats: jsonb("device_stats"),
         browserStats: jsonb("browser_stats"),
         countryStats: jsonb("country_stats"),
-        trafficSources: jsonb("traffic_sources"), // UTM tracking
-        conversionFunnel: jsonb("conversion_funnel"), // Step-by-step conversion data
+        trafficSources: jsonb("traffic_sources"),
+        conversionFunnel: jsonb("conversion_funnel"),
 
-        createdAt: timestamp("created_at").notNull().defaultNow(),
+        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
     },
     (t) => ({
         uqFormDate: uniqueIndex("form_analytics_form_date_uq").on(t.formId, t.date),
-        idxFormDate: index("form_analytics_form_date_idx").on(t.formId, t.date),
+
+        ck_views_nonnegative: sql`CHECK (${t.views} >= 0)`,
+        ck_starts_nonnegative: sql`CHECK (${t.starts} >= 0)`,
+        ck_completions_nonnegative: sql`CHECK (${t.completions} >= 0)`,
+        ck_qualified_leads_nonnegative: sql`CHECK (${t.qualifiedLeads} >= 0)`,
+        ck_booking_requests_nonnegative: sql`CHECK (${t.bookingRequests} >= 0)`,
+        ck_successful_bookings_nonnegative: sql`CHECK (${t.successfulBookings} >= 0)`,
+        ck_spam_blocked_nonnegative: sql`CHECK (${t.spamBlocked} >= 0)`,
+        ck_avg_qualification_score_range: sql`CHECK (${t.averageQualificationScore} >= 0 AND ${t.averageQualificationScore} <= 100)`,
+        ck_avg_intent_score_range: sql`CHECK (${t.averageIntentScore} >= 0 AND ${t.averageIntentScore} <= 100)`,
+        ck_avg_time_to_complete_nonnegative: sql`CHECK (${t.averageTimeToComplete} >= 0)`,
     })
 );
 
-/**
- * Form Integrations - Enhanced with more providers
- */
+/* ---------------- Form Integrations ---------------- */
 export const formIntegrations = pgTable(
     "form_integrations",
     {
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        formId: text("form_id")
-            .notNull()
-            .references(() => forms.id, { onDelete: "cascade" }),
+        formId: text("form_id").notNull().references(() => forms.id, { onDelete: "cascade" }),
 
-        type: text("type").notNull(), // webhook, zapier, email, crm, calendar
-        provider: text("provider"), // specific provider name (hubspot, salesforce, etc.)
+        type: text("type").notNull(),
+        provider: text("provider"),
         name: text("name").notNull(),
         isActive: boolean("is_active").notNull().default(true),
 
         config: jsonb("config").notNull(),
 
-        // Enhanced execution tracking
-        lastExecuted: timestamp("last_executed"),
-        lastStatus: text("last_status"), // success|failed|pending
+        lastExecuted: timestamp("last_executed", { mode: "date" }),
+        lastStatus: text("last_status"),
         executionCount: integer("execution_count").notNull().default(0),
         failureCount: integer("failure_count").notNull().default(0),
         lastError: text("last_error"),
 
-        // Filtering and conditions
-        executionConditions: jsonb("execution_conditions"), // When to execute this integration
-        fieldMappings: jsonb("field_mappings"), // How form fields map to integration fields
+        executionConditions: jsonb("execution_conditions"),
+        fieldMappings: jsonb("field_mappings"),
 
-        createdAt: timestamp("created_at").notNull().defaultNow(),
-        updatedAt: timestamp("updated_at").notNull().defaultNow(),
+        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
+        updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
     },
     (t) => ({
-        idxFormIntegrationType: index("form_integrations_form_type_idx").on(t.formId, t.type),
-        idxProvider: index("form_integrations_provider_idx").on(t.provider),
+        idxFormType: index("form_integrations_form_type_idx").on(t.formId, t.type),
+        idxActive: index("form_integrations_active_idx").on(t.isActive).where(sql`${t.isActive} = true`),
+
+        ck_execution_count_nonnegative: sql`CHECK (${t.executionCount} >= 0)`,
+        ck_failure_count_nonnegative: sql`CHECK (${t.failureCount} >= 0)`,
     })
 );
 
-/**
- * Relations (type-safe helpers)
- */
+/* ---------------- Relations ---------------- */
 export const formsRelations = relations(forms, ({ many, one }) => ({
     owner: one(user, { fields: [forms.userId], references: [user.id] }),
     questions: many(formQuestions),

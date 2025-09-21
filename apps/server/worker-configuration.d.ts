@@ -6,7 +6,7 @@ declare namespace Cloudflare {
         mainModule: typeof import("./src/index");
     }
     interface Env {
-        NODE_ENV: "production";
+        NODE_ENV: "development" | "production";
         DATABASE_URL: string;
         DATABASE_URL_POOLER: string;
         CORS_ORIGIN: string;
@@ -25,14 +25,48 @@ declare namespace Cloudflare {
         GOOGLE_CLIENT_SECRET: string;
         LINKEDIN_CLIENT_ID: string;
         LINKEDIN_CLIENT_SECRET: string;
+
+        // Cloudflare bindings
+        HYPERDRIVE: Hyperdrive;
+        KV: KVNamespace;
     }
 }
+
 interface CloudflareBindings extends Cloudflare.Env {}
+
 type StringifyValues<EnvType extends Record<string, unknown>> = {
     [Binding in keyof EnvType]: EnvType[Binding] extends string ? EnvType[Binding] : string;
 };
+
 declare namespace NodeJS {
     interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "NODE_ENV" | "DATABASE_URL" | "DATABASE_URL_POOLER" | "CORS_ORIGIN" | "BETTER_AUTH_SECRET" | "BETTER_AUTH_URL" | "POLAR_ACCESS_TOKEN" | "POLAR_SUCCESS_URL">> {}
+}
+
+// Cloudflare binding type definitions
+interface Hyperdrive {
+    connectionString: string;
+}
+
+interface KVNamespace {
+    get(key: string, type?: "text"): Promise<string | null>;
+    get(key: string, type: "json"): Promise<any>;
+    get(key: string, type: "arrayBuffer"): Promise<ArrayBuffer | null>;
+    get(key: string, type: "stream"): Promise<ReadableStream | null>;
+    put(key: string, value: string | ArrayBuffer | ReadableStream, options?: {
+        expiration?: number;
+        expirationTtl?: number;
+        metadata?: any;
+    }): Promise<void>;
+    delete(key: string): Promise<void>;
+    list(options?: {
+        prefix?: string;
+        limit?: number;
+        cursor?: string;
+    }): Promise<{
+        keys: Array<{ name: string; expiration?: number; metadata?: any }>;
+        list_complete: boolean;
+        cursor?: string;
+    }>;
 }
 
 // Begin runtime types

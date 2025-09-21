@@ -1,19 +1,18 @@
-﻿// business/index.ts
+﻿// src/db/schema/business/index.ts
 
-// Billing & subscriptions
+// 1. Core authentication dependency (if user was here, it would go first, but it's in auth.ts)
+// (Note: user is in auth.ts, so it needs to be exported before business in the main index.ts)
+
+// 2. Teams & members (depends on user)
+export * from "./teams"; // Export teams early within business
+
+// 3. Billing & subscriptions (might depend on user)
 export * from "./billing";
 
-// Teams & members
-export * from "./teams";
-
-// Analytics & activity logs
+// 4. Analytics & activity logs (might depend on user, forms)
 export * from "./analytics";
 
-// Feature flags
+// 5. Other features...
 export * from "./featureFlags";
-
-// Feedback & support
 export * from "./feedback";
-
-// Experiments & A/B testing
 export * from "./experiments";

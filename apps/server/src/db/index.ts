@@ -1,7 +1,7 @@
 // db/index.ts
 import { neon, neonConfig } from "@neondatabase/serverless";
 import { drizzle } from "drizzle-orm/neon-http";
-import { env } from "cloudflare:workers";
+import { env } from "../lib/env"; // swapped from "cloudflare:workers"
 import ws from "ws";
 
 neonConfig.webSocketConstructor = ws;

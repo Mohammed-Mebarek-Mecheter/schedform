@@ -14,9 +14,12 @@ declare namespace Cloudflare {
         BETTER_AUTH_URL: string;
         POLAR_ACCESS_TOKEN: string;
         POLAR_SUCCESS_URL: string;
-        POLAR_STARTER_PRODUCT_ID: string;
-        POLAR_PRO_PRODUCT_ID: string;
-        POLAR_BUSINESS_PRODUCT_ID: string;
+        POLAR_STARTER_MONTHLY_PRODUCT_ID: string;
+        POLAR_PRO_MONTHLY_PRODUCT_ID: string;
+        POLAR_BUSINESS_MONTHLY_PRODUCT_ID: string;
+        POLAR_STARTER_YEARLY_PRODUCT_ID: string;
+        POLAR_PRO_YEARLY_PRODUCT_ID: string;
+        POLAR_BUSINESS_YEARLY_PRODUCT_ID: string;
         APP_URL: string;
         POLAR_WEBHOOK_SECRET: string;
         FACEBOOK_CLIENT_ID: string;

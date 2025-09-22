@@ -28,6 +28,8 @@ import { validator } from "validation-better-auth";
 import { emailHarmony, phoneHarmony } from "better-auth-harmony";
 import { z } from "zod";
 import {drizzleAdapter} from "better-auth/adapters/drizzle";
+import {eq} from "drizzle-orm";
+import {organizations} from "@/db/schema/auth";
 
 // Create access control for SchedForm's permissions
 const schedFormStatement = {
@@ -1127,22 +1129,51 @@ const baseAuthConfig: BetterAuthOptions = {
         // Polar billing integration
         polar({
             client: polarClient,
-            createCustomerOnSignUp: true,
+            createCustomerOnSignUp: true, // Now enabled for automatic customer creation
             enableCustomerPortal: true,
+            getCustomerCreateParams: async ({ user }, request) => {
+                // Ensure required fields are defined
+                if (!user.id || !user.email) {
+                    throw new Error("User ID and email are required");
+                }
+
+                return {
+                    metadata: {
+                        userId: user.id,  // Now guaranteed to be defined
+                        name: user.name || user.email,  // Fallback to email if name is undefined
+                        email: user.email,  // Now guaranteed to be defined
+                        signupSource: "schedform",
+                        createdAt: new Date().toISOString()
+                    }
+                };
+            },
             use: [
                 checkout({
                     products: [
+                        // Monthly plans
                         {
-                            productId: env.POLAR_STARTER_PRODUCT_ID,
-                            slug: "starter",
+                            productId: env.POLAR_STARTER_MONTHLY_PRODUCT_ID,
+                            slug: "starter-monthly",
                         },
                         {
-                            productId: env.POLAR_PRO_PRODUCT_ID,
-                            slug: "professional",
+                            productId: env.POLAR_PRO_MONTHLY_PRODUCT_ID,
+                            slug: "professional-monthly",
                         },
                         {
-                            productId: env.POLAR_BUSINESS_PRODUCT_ID,
-                            slug: "business",
+                            productId: env.POLAR_BUSINESS_MONTHLY_PRODUCT_ID,
+                            slug: "business-monthly",
+                        },
+                        {
+                            productId: env.POLAR_STARTER_YEARLY_PRODUCT_ID,
+                            slug: "starter-yearly",
+                        },
+                        {
+                            productId: env.POLAR_PRO_YEARLY_PRODUCT_ID,
+                            slug: "professional-yearly",
+                        },
+                        {
+                            productId: env.POLAR_BUSINESS_YEARLY_PRODUCT_ID,
+                            slug: "business-yearly",
                         },
                     ],
                     successUrl: `${env.POLAR_SUCCESS_URL}/success?session_id={CHECKOUT_ID}`,
@@ -1153,12 +1184,208 @@ const baseAuthConfig: BetterAuthOptions = {
                     secret: env.POLAR_WEBHOOK_SECRET,
                     onSubscriptionActive: async (payload) => {
                         console.log("Subscription activated:", payload);
+                        try {
+                            const polarCustomerId = payload.data.customer?.id; // Get Polar Customer ID
+                            const subscriptionId = payload.data.id; // Get Polar Subscription ID
+                            const currentPeriodEnd = payload.data.currentPeriodEnd ? new Date(payload.data.currentPeriodEnd) : null; // Convert timestamp if present
+
+                            // --- Map Polar data to your fields ---
+                            // You need to implement the logic to determine planType based on the payload
+                            // This might involve checking payload.data.price.productId, payload.data.productId, etc.
+                            // Example (replace with your actual mapping logic):
+                            let planType = "free"; // Default
+                            if (payload.data.productId === env.POLAR_STARTER_MONTHLY_PRODUCT_ID ||
+                                payload.data.productId === env.POLAR_STARTER_YEARLY_PRODUCT_ID) {
+                                planType = "starter";
+                            } else if (payload.data.productId === env.POLAR_PRO_MONTHLY_PRODUCT_ID ||
+                                payload.data.productId === env.POLAR_PRO_YEARLY_PRODUCT_ID) {
+                                planType = "professional";
+                            } else if (payload.data.productId === env.POLAR_BUSINESS_MONTHLY_PRODUCT_ID ||
+                                payload.data.productId === env.POLAR_BUSINESS_YEARLY_PRODUCT_ID) {
+                                planType = "business";
+                            }
+                            const subscriptionStatus = "active"; // Map Polar 'active' status
+
+                            if (!polarCustomerId) {
+                                console.error("Polar Customer ID not found in payload for active subscription:", payload);
+                                return; // Or handle error appropriately
+                            }
+
+                            // Update the organization record
+                            const result = await defaultDb.update(organizations)
+                                .set({
+                                    subscriptionStatus, // Set status to 'active'
+                                    planType,           // Set the mapped plan type
+                                    subscriptionId,     // Store the Polar subscription ID
+                                    currentPeriodEnd,   // Set the period end date
+                                    // Optionally update other fields like features/limits based on planType here
+                                })
+                                .where(eq(organizations.polarCustomerId, polarCustomerId))
+                                .returning({ updatedId: organizations.id }); // Optional: get the ID of the updated org
+
+                            if (result.length > 0) {
+                                console.log(`Organization ${result[0].updatedId} updated for active subscription ${subscriptionId}`);
+                            } else {
+                                console.warn(`No organization found for Polar Customer ID: ${polarCustomerId}`);
+                                // Consider logging this for investigation if it happens unexpectedly
+                            }
+                        } catch (error) {
+                            console.error("Error updating organization on subscription active:", error);
+                            // Depending on your setup, you might want to re-throw or handle differently
+                        }
                     },
                     onSubscriptionCanceled: async (payload) => {
                         console.log("Subscription canceled:", payload);
+                        try {
+                            const polarCustomerId = payload.data.customer?.id;
+                            const subscriptionId = payload.data.id; // Useful for logging/context
+                            const currentPeriodEnd = payload.data.currentPeriodEnd ? new Date(payload.data.currentPeriodEnd) : null;
+
+                            if (!polarCustomerId) {
+                                console.error("Polar Customer ID not found in payload for canceled subscription:", payload);
+                                return;
+                            }
+
+                            const subscriptionStatus = "canceled"; // Map Polar 'canceled' status
+                            // planType might remain the same or be set to 'free' depending on your logic
+                            // Let's assume it stays the same until explicitly changed by a new subscription or downgrade
+
+                            const result = await defaultDb.update(organizations)
+                                .set({
+                                    subscriptionStatus, // Set status to 'canceled'
+                                    // planType: "free", // Example: Reset plan if desired
+                                    currentPeriodEnd,   // Update the end date (might be immediate or end of period)
+                                    // subscriptionId could be cleared or kept, depending on your needs
+                                    // subscriptionId: null,
+                                })
+                                .where(eq(organizations.polarCustomerId, polarCustomerId))
+                                .returning({ updatedId: organizations.id });
+
+                            if (result.length > 0) {
+                                console.log(`Organization ${result[0].updatedId} updated for canceled subscription ${subscriptionId}`);
+                            } else {
+                                console.warn(`No organization found for Polar Customer ID: ${polarCustomerId}`);
+                            }
+                        } catch (error) {
+                            console.error("Error updating organization on subscription canceled:", error);
+                        }
                     },
-                    onOrderPaid: async (payload) => {
-                        console.log("Order paid:", payload);
+                    onSubscriptionUpdated: async (payload) => {
+                        console.log("Subscription updated:", payload);
+                        try {
+                            const polarCustomerId = payload.data.customer?.id;
+                            const subscriptionId = payload.data.id;
+                            const currentPeriodEnd = payload.data.currentPeriodEnd ? new Date(payload.data.currentPeriodEnd) : null;
+
+                            // --- Map updated Polar data to your fields ---
+                            let planType = "free"; // Default or fetch current if unchanged
+                            // Implement logic similar to onSubscriptionActive to determine the *new* planType based on updated payload data
+                            // Example (replace with your actual mapping logic based on *updated* data):
+                            if (payload.data.productId === env.POLAR_STARTER_MONTHLY_PRODUCT_ID ||
+                                payload.data.productId === env.POLAR_STARTER_YEARLY_PRODUCT_ID) {
+                                planType = "starter";
+                            } else if (payload.data.productId === env.POLAR_PRO_MONTHLY_PRODUCT_ID ||
+                                payload.data.productId === env.POLAR_PRO_YEARLY_PRODUCT_ID) {
+                                planType = "professional";
+                            } else if (payload.data.productId === env.POLAR_BUSINESS_MONTHLY_PRODUCT_ID ||
+                                payload.data.productId === env.POLAR_BUSINESS_YEARLY_PRODUCT_ID) {
+                                planType = "business";
+                            }
+                            // Status might also change on update, check payload.data.status
+                            const subscriptionStatus = payload.data.status || "active"; // Default to active if not explicitly provided in update context
+
+                            if (!polarCustomerId) {
+                                console.error("Polar Customer ID not found in payload for updated subscription:", payload);
+                                return;
+                            }
+
+                            const result = await defaultDb.update(organizations)
+                                .set({
+                                    subscriptionStatus, // Set potentially updated status
+                                    planType,           // Set potentially updated plan type
+                                    subscriptionId,     // Ensure subscription ID is correct
+                                    currentPeriodEnd,   // Update the period end date
+                                    // Update other fields like features/limits based on new planType if needed
+                                })
+                                .where(eq(organizations.polarCustomerId, polarCustomerId))
+                                .returning({ updatedId: organizations.id });
+
+                            if (result.length > 0) {
+                                console.log(`Organization ${result[0].updatedId} updated for updated subscription ${subscriptionId}`);
+                            } else {
+                                console.warn(`No organization found for Polar Customer ID: ${polarCustomerId}`);
+                            }
+                        } catch (error) {
+                            console.error("Error updating organization on subscription updated:", error);
+                        }
+                    },
+                    onSubscriptionRevoked: async (payload) => {
+                        // Similar logic to canceled, potentially immediate effect
+                        console.log("Subscription revoked:", payload);
+                        try {
+                            const polarCustomerId = payload.data.customer?.id;
+                            const subscriptionId = payload.data.id;
+                            const currentPeriodEnd = payload.data.currentPeriodEnd ? new Date(payload.data.currentPeriodEnd) : null; // Might be immediate
+
+                            if (!polarCustomerId) {
+                                console.error("Polar Customer ID not found in payload for revoked subscription:", payload);
+                                return;
+                            }
+
+                            const subscriptionStatus = "revoked"; // Or map to 'canceled'
+
+                            const result = await defaultDb.update(organizations)
+                                .set({
+                                    subscriptionStatus,
+                                    currentPeriodEnd,
+                                    // planType: "free", // Example: Reset plan
+                                })
+                                .where(eq(organizations.polarCustomerId, polarCustomerId))
+                                .returning({ updatedId: organizations.id });
+
+                            if (result.length > 0) {
+                                console.log(`Organization ${result[0].updatedId} updated for revoked subscription ${subscriptionId}`);
+                            } else {
+                                console.warn(`No organization found for Polar Customer ID: ${polarCustomerId}`);
+                            }
+                        } catch (error) {
+                            console.error("Error updating organization on subscription revoked:", error);
+                        }
+                    },
+                    onSubscriptionUncanceled: async (payload) => {
+                        console.log("Subscription uncanceled:", payload);
+                        try {
+                            const polarCustomerId = payload.data.customer?.id;
+                            const subscriptionId = payload.data.id;
+                            const currentPeriodEnd = payload.data.currentPeriodEnd ? new Date(payload.data.currentPeriodEnd) : null;
+
+                            if (!polarCustomerId) {
+                                console.error("Polar Customer ID not found in payload for uncanceled subscription:", payload);
+                                return;
+                            }
+
+                            // Revert the cancellation status. Check payload.data.status for the actual new status.
+                            const subscriptionStatus = payload.data.status === "active" ? "active" : "uncanceled"; // Or just use payload.data.status
+
+                            // planType should likely remain the same as before cancellation
+
+                            const result = await defaultDb.update(organizations)
+                                .set({
+                                    subscriptionStatus, // Set back to active/uncanceled
+                                    // planType remains unchanged
+                                    currentPeriodEnd,   // Update period end if it changed
+                                })
+                                .where(eq(organizations.polarCustomerId, polarCustomerId))
+                                .returning({ updatedId: organizations.id });
+
+                            if (result.length > 0) {
+                                console.log(`Organization ${result[0].updatedId} updated for uncanceled subscription ${subscriptionId}`);
+                            } else {
+                                console.warn(`No organization found for Polar Customer ID: ${polarCustomerId}`);
+                            }
+                        } catch (error) {
+                            console.error("Error updating organization on subscription uncanceled:", error);
+                        }
                     },
                 }),
             ],
@@ -1189,16 +1416,6 @@ const baseAuthConfig: BetterAuthOptions = {
             role: {
                 type: "string",
                 defaultValue: "user",
-                input: false,
-            },
-            subscription: {
-                type: "string",
-                defaultValue: "free",
-                input: false,
-            },
-            subscriptionStatus: {
-                type: "string",
-                defaultValue: "inactive",
                 input: false,
             },
         },
@@ -1238,3 +1455,6 @@ export function createAuth(
     // For CLI and development, use the base configuration
     return betterAuth(baseAuthConfig);
 }
+
+// Export for CLI schema generation - this MUST be a direct betterAuth instance
+export const auth = betterAuth(baseAuthConfig);

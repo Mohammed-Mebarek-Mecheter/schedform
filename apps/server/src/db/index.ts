@@ -2,6 +2,7 @@
 import { neon, neonConfig } from "@neondatabase/serverless";
 import { drizzle } from "drizzle-orm/neon-http";
 import { env } from "@/lib/env";
+import "dotenv/config";
 import ws from "ws";
 import * as schema from "./schema";
 

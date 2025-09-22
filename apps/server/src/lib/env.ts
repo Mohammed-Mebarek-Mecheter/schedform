@@ -1,4 +1,6 @@
 // lib/env.ts
+import "dotenv/config";
+
 let env: Record<string, string> = {};
 let bindings: Cloudflare.Env | null = null;
 

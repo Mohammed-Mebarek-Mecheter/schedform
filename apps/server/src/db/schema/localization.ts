@@ -9,14 +9,14 @@ import {
     pgEnum,
     index,
     uniqueIndex,
-    real, varchar,
+    real,
+    varchar,
 } from "drizzle-orm/pg-core";
 import { relations, sql } from "drizzle-orm";
-import { user } from "@/db/schema/auth";
+import { users, organizations, teams } from "@/db/schema/auth";
 import { forms, formQuestions, questionChoices } from "@/db/schema/forms";
 import { eventTypes } from "@/db/schema/scheduling";
-import {teams} from "@/db/schema/business";
-import {workflows} from "@/db/schema/workflows";
+import { workflows } from "@/db/schema/workflows";
 
 /* ---------------- Enums ---------------- */
 export const languageStatusEnum = pgEnum("language_status", [
@@ -108,8 +108,8 @@ export const formTranslations = pgTable(
         isPublished: boolean("is_published").notNull().default(false),
         progress: integer("progress").notNull().default(0),
 
-        translatedBy: text("translated_by").references(() => user.id, { onDelete: "set null" }),
-        reviewedBy: text("reviewed_by").references(() => user.id, { onDelete: "set null" }),
+        translatedBy: text("translated_by").references(() => users.id, { onDelete: "set null" }),
+        reviewedBy: text("reviewed_by").references(() => users.id, { onDelete: "set null" }),
         publishedAt: timestamp("published_at", { mode: "date" }),
 
         // Technical metadata
@@ -208,7 +208,8 @@ export const regionalSettings = pgTable(
     "regional_settings",
     {
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        userId: text("user_id").references(() => user.id, { onDelete: "cascade" }),
+        userId: text("user_id").references(() => users.id, { onDelete: "cascade" }),
+        organizationId: text("organization_id").references(() => organizations.id, { onDelete: "cascade" }),
         teamId: text("team_id").references(() => teams.id, { onDelete: "cascade" }),
 
         regionCode: text("region_code").notNull(), // ISO 3166-1 or custom
@@ -255,8 +256,9 @@ export const regionalSettings = pgTable(
         uqRegionScope: uniqueIndex("regional_settings_region_scope_uq").on(
             t.regionCode,
             t.userId,
+            t.organizationId,
             t.teamId
-        ).where(sql`${t.userId} IS NOT NULL OR ${t.teamId} IS NOT NULL`),
+        ).where(sql`${t.userId} IS NOT NULL OR ${t.organizationId} IS NOT NULL OR ${t.teamId} IS NOT NULL`),
         idxActive: index("regional_settings_active_idx").on(t.isActive),
     })
 );
@@ -266,7 +268,7 @@ export const userLanguagePreferences = pgTable(
     "user_language_preferences",
     {
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        userId: text("user_id").notNull().references(() => user.id, { onDelete: "cascade" }),
+        userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
 
         preferredLanguage: text("preferred_language").notNull().references(() => supportedLanguages.code, { onDelete: "restrict" }),
         uiLanguage: text("ui_language").references(() => supportedLanguages.code, { onDelete: "restrict" }),
@@ -292,6 +294,44 @@ export const userLanguagePreferences = pgTable(
     })
 );
 
+/* ---------------- Organization Language Settings ---------------- */
+export const organizationLanguageSettings = pgTable(
+    "organization_language_settings",
+    {
+        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
+        organizationId: text("organization_id").notNull().references(() => organizations.id, { onDelete: "cascade" }),
+
+        // Organization-wide language settings
+        defaultLanguage: text("default_language").notNull().references(() => supportedLanguages.code, { onDelete: "restrict" }),
+        fallbackLanguage: text("fallback_language").references(() => supportedLanguages.code, { onDelete: "restrict" }),
+        supportedLanguages: jsonb("supported_languages").notNull().default([]), // Array of language codes
+
+        // Auto-translation settings
+        autoTranslateEnabled: boolean("auto_translate_enabled").default(false),
+        autoTranslateProvider: text("auto_translate_provider"), // "google", "deepl", "azure"
+        translationQuality: text("translation_quality").default("standard"), // "standard", "premium"
+
+        // Regional settings for organization
+        defaultTimezone: text("default_timezone").default("UTC"),
+        defaultDateFormat: text("default_date_format").default("YYYY-MM-DD"),
+        defaultTimeFormat: text("default_time_format").default("HH:mm"),
+
+        // Compliance settings
+        requireLanguageConsent: boolean("require_language_consent").default(false),
+        trackLanguageConsent: boolean("track_language_consent").default(true),
+
+        // UI customization per language
+        localizedBranding: jsonb("localized_branding"), // { "en": { "logo": "url", "colors": {} }, "es": { ... } }
+
+        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
+        updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
+    },
+    (t) => ({
+        uqOrganization: uniqueIndex("organization_language_settings_org_uq").on(t.organizationId),
+        idxDefaultLanguage: index("org_language_settings_default_language_idx").on(t.defaultLanguage),
+    })
+);
+
 /* ---------------- Translation Template Library ---------------- */
 export const translationTemplates = pgTable(
     "translation_templates",
@@ -310,6 +350,9 @@ export const translationTemplates = pgTable(
         requiredVariables: jsonb("required_variables"), // Array of variable names
         isSystemTemplate: boolean("is_system_template").notNull().default(true), // vs user-created
 
+        // Organization-specific templates
+        organizationId: text("organization_id").references(() => organizations.id, { onDelete: "cascade" }),
+
         // Usage tracking
         usageCount: integer("usage_count").notNull().default(0),
         lastUsed: timestamp("last_used", { mode: "date" }),
@@ -318,9 +361,10 @@ export const translationTemplates = pgTable(
         updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
     },
     (t) => ({
-        uqTemplateKey: uniqueIndex("translation_templates_key_uq").on(t.templateKey),
+        uqTemplateKey: uniqueIndex("translation_templates_key_uq").on(t.templateKey, t.organizationId),
         idxCategory: index("translation_templates_category_idx").on(t.category),
         idxSystem: index("translation_templates_system_idx").on(t.isSystemTemplate),
+        idxOrganization: index("translation_templates_organization_idx").on(t.organizationId),
     })
 );
 
@@ -337,8 +381,8 @@ export const translationTemplateContent = pgTable(
 
         // Translation status and quality
         status: translationStatusEnum("status").notNull().default("draft"),
-        translatedBy: text("translated_by").references(() => user.id, { onDelete: "set null" }),
-        reviewedBy: text("reviewed_by").references(() => user.id, { onDelete: "set null" }),
+        translatedBy: text("translated_by").references(() => users.id, { onDelete: "set null" }),
+        reviewedBy: text("reviewed_by").references(() => users.id, { onDelete: "set null" }),
 
         // Version control
         version: integer("version").notNull().default(1),
@@ -487,6 +531,7 @@ export const translationStatistics = pgTable(
 
         date: timestamp("date", { mode: "date" }).notNull(),
         languageCode: text("language_code").notNull().references(() => supportedLanguages.code, { onDelete: "cascade" }),
+        organizationId: text("organization_id").references(() => organizations.id, { onDelete: "cascade" }),
 
         // Usage statistics
         totalRequests: integer("total_requests").notNull().default(0),
@@ -510,9 +555,10 @@ export const translationStatistics = pgTable(
         createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
     },
     (t) => ({
-        uqDateLanguage: uniqueIndex("translation_statistics_date_language_uq").on(t.date, t.languageCode),
+        uqDateLanguageOrg: uniqueIndex("translation_statistics_date_language_org_uq").on(t.date, t.languageCode, t.organizationId),
         idxLanguageDate: index("translation_statistics_language_date_idx").on(t.languageCode, t.date),
         idxPerformance: index("translation_statistics_performance_idx").on(t.averageDetectionTime, t.averageTranslationTime),
+        idxOrganization: index("translation_statistics_organization_idx").on(t.organizationId, t.date),
 
         chkTotalRequests: sql`CHECK (${t.totalRequests} >= 0)`,
         chkCacheHits: sql`CHECK (${t.cacheHits} >= 0)`,
@@ -535,13 +581,14 @@ export const supportedLanguagesRelations = relations(supportedLanguages, ({ many
     choiceTranslations: many(choiceTranslations),
     eventTypeTranslations: many(eventTypeTranslations),
     userPreferences: many(userLanguagePreferences),
+    organizationSettings: many(organizationLanguageSettings),
 }));
 
 export const formTranslationsRelations = relations(formTranslations, ({ one }) => ({
     form: one(forms, { fields: [formTranslations.formId], references: [forms.id] }),
     language: one(supportedLanguages, { fields: [formTranslations.languageCode], references: [supportedLanguages.code] }),
-    translator: one(user, { fields: [formTranslations.translatedBy], references: [user.id] }),
-    reviewer: one(user, { fields: [formTranslations.reviewedBy], references: [user.id] }),
+    translator: one(users, { fields: [formTranslations.translatedBy], references: [users.id] }),
+    reviewer: one(users, { fields: [formTranslations.reviewedBy], references: [users.id] }),
 }));
 
 export const questionTranslationsRelations = relations(questionTranslations, ({ one }) => ({
@@ -560,21 +607,32 @@ export const eventTypeTranslationsRelations = relations(eventTypeTranslations, (
 }));
 
 export const regionalSettingsRelations = relations(regionalSettings, ({ one }) => ({
-    user: one(user, { fields: [regionalSettings.userId], references: [user.id] }),
+    user: one(users, { fields: [regionalSettings.userId], references: [users.id] }),
+    organization: one(organizations, { fields: [regionalSettings.organizationId], references: [organizations.id] }),
     team: one(teams, { fields: [regionalSettings.teamId], references: [teams.id] }),
 }));
 
 export const userLanguagePreferencesRelations = relations(userLanguagePreferences, ({ one }) => ({
-    user: one(user, { fields: [userLanguagePreferences.userId], references: [user.id] }),
+    user: one(users, { fields: [userLanguagePreferences.userId], references: [users.id] }),
     preferredLanguage: one(supportedLanguages, { fields: [userLanguagePreferences.preferredLanguage], references: [supportedLanguages.code] }),
     uiLanguage: one(supportedLanguages, { fields: [userLanguagePreferences.uiLanguage], references: [supportedLanguages.code] }),
     contentLanguage: one(supportedLanguages, { fields: [userLanguagePreferences.contentLanguage], references: [supportedLanguages.code] }),
+}));
+
+export const organizationLanguageSettingsRelations = relations(organizationLanguageSettings, ({ one }) => ({
+    organization: one(organizations, { fields: [organizationLanguageSettings.organizationId], references: [organizations.id] }),
+    defaultLanguage: one(supportedLanguages, { fields: [organizationLanguageSettings.defaultLanguage], references: [supportedLanguages.code] }),
+    fallbackLanguage: one(supportedLanguages, { fields: [organizationLanguageSettings.fallbackLanguage], references: [supportedLanguages.code] }),
 }));
 
 export const translationTemplatesRelations = relations(translationTemplates, ({ one, many }) => ({
     defaultLanguageRef: one(supportedLanguages, {
         fields: [translationTemplates.defaultLanguage],
         references: [supportedLanguages.code]
+    }),
+    organization: one(organizations, {
+        fields: [translationTemplates.organizationId],
+        references: [organizations.id]
     }),
     translations: many(translationTemplateContent),
 }));
@@ -588,13 +646,13 @@ export const translationTemplateContentRelations = relations(translationTemplate
         fields: [translationTemplateContent.languageCode],
         references: [supportedLanguages.code]
     }),
-    translator: one(user, {
+    translator: one(users, {
         fields: [translationTemplateContent.translatedBy],
-        references: [user.id]
+        references: [users.id]
     }),
-    reviewer: one(user, {
+    reviewer: one(users, {
         fields: [translationTemplateContent.reviewedBy],
-        references: [user.id]
+        references: [users.id]
     }),
 }));
 
@@ -638,5 +696,9 @@ export const translationStatisticsRelations = relations(translationStatistics, (
     language: one(supportedLanguages, {
         fields: [translationStatistics.languageCode],
         references: [supportedLanguages.code]
+    }),
+    organization: one(organizations, {
+        fields: [translationStatistics.organizationId],
+        references: [organizations.id]
     }),
 }));

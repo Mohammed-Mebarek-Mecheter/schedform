@@ -12,10 +12,10 @@ import {
     real,
 } from "drizzle-orm/pg-core";
 import { relations, sql } from "drizzle-orm";
-import {formResponses, forms} from "@/db/schema/forms";
-import {bookings, eventTypes} from "@/db/schema/scheduling";
-import {user} from "@/db/schema/auth";
-import {supportedLanguages, translationStatusEnum} from "@/db/schema/localization";
+import { formResponses, forms } from "@/db/schema/forms";
+import { bookings, eventTypes } from "@/db/schema/scheduling";
+import { users, organizations } from "@/db/schema/auth";
+import { supportedLanguages, translationStatusEnum } from "@/db/schema/localization";
 
 /**
  * Enums for conversational flow states
@@ -66,6 +66,11 @@ export const conversationalFlows = pgTable(
         bookingId: text("booking_id")
             .references(() => bookings.id, { onDelete: "set null" }),
 
+        // Organization context for multi-tenant support
+        organizationId: text("organization_id")
+            .notNull()
+            .references(() => organizations.id, { onDelete: "cascade" }),
+
         // Flow tracking with proper validation
         status: flowStatusEnum("status").notNull().default("form_started"),
         schedulingMode: flowSchedulingModeEnum("scheduling_mode").notNull().default("instant"),
@@ -114,7 +119,7 @@ export const conversationalFlows = pgTable(
         requiresApproval: boolean("requires_approval").notNull().default(false),
         approvalRequiredReason: text("approval_required_reason"),
         approvedBy: text("approved_by")
-            .references(() => user.id, { onDelete: "set null" }),
+            .references(() => users.id, { onDelete: "set null" }), // Updated reference
         approvedAt: timestamp("approved_at", { mode: "date" }),
 
         // Email/SMS Verification for high-value bookings
@@ -163,6 +168,10 @@ export const conversationalFlows = pgTable(
         culturalContext: jsonb("cultural_context"), // Regional business practices, communication styles
         preferredCommunicationStyle: text("preferred_communication_style"), // formal, casual, etc.
 
+        // Plan-specific limits tracking
+        planType: text("plan_type").default("free"), // free, starter, professional, business
+        usageCount: integer("usage_count").default(0), // Track usage against monthly limits
+
         createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
         updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
     },
@@ -179,6 +188,8 @@ export const conversationalFlows = pgTable(
             .on(t.createdAt, t.status), // For dashboard queries
         idxLastActive: index("conversational_flows_last_active_idx")
             .on(t.lastActiveAt), // For abandonment detection
+        idxOrganization: index("conversational_flows_organization_idx")
+            .on(t.organizationId), // Multi-tenant partitioning
 
         // Unique constraints
         uqFormResponse: uniqueIndex("conversational_flows_form_response_uq")
@@ -200,6 +211,7 @@ export const conversationalFlows = pgTable(
         chkTimeToQualify: sql`CHECK (${t.timeToQualify} IS NULL OR ${t.timeToQualify} > 0)`,
         chkTimeToBook: sql`CHECK (${t.timeToBook} IS NULL OR ${t.timeToBook} > 0)`,
         chkSpamScore: sql`CHECK (${t.spamScore} IS NULL OR (${t.spamScore} >= 0 AND ${t.spamScore} <= 100))`,
+        chkUsageCount: sql`CHECK (${t.usageCount} >= 0)`,
     })
 );
 
@@ -531,7 +543,10 @@ export const flowTemplates = pgTable(
         usageCount: integer("usage_count").notNull().default(0),
         averageRating: real("average_rating").notNull().default(0),
 
-        createdBy: text("created_by").references(() => user.id, { onDelete: "set null" }),
+        createdBy: text("created_by").references(() => users.id, { onDelete: "set null" }), // Updated reference
+        organizationId: text("organization_id")
+            .notNull()
+            .references(() => organizations.id, { onDelete: "cascade" }),
         isActive: boolean("is_active").notNull().default(true),
 
         createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
@@ -541,6 +556,7 @@ export const flowTemplates = pgTable(
         idxTemplateType: index("flow_templates_type_idx").on(t.templateType, t.category),
         idxPublic: index("flow_templates_public_idx").on(t.isPublic, t.isActive),
         idxUsage: index("flow_templates_usage_idx").on(t.usageCount, t.averageRating),
+        idxOrganization: index("flow_templates_organization_idx").on(t.organizationId),
 
         chkUsageCount: sql`CHECK (${t.usageCount} >= 0)`,
         chkAverageRating: sql`CHECK (${t.averageRating} >= 0 AND ${t.averageRating} <= 5)`,
@@ -566,8 +582,8 @@ export const flowTemplateTranslations = pgTable(
 
         // Translation metadata
         status: translationStatusEnum("status").notNull().default("draft"),
-        translatedBy: text("translated_by").references(() => user.id, { onDelete: "set null" }),
-        reviewedBy: text("reviewed_by").references(() => user.id, { onDelete: "set null" }),
+        translatedBy: text("translated_by").references(() => users.id, { onDelete: "set null" }), // Updated reference
+        reviewedBy: text("reviewed_by").references(() => users.id, { onDelete: "set null" }), // Updated reference
 
         createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
         updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
@@ -586,7 +602,8 @@ export const conversationalFlowsRelations = relations(conversationalFlows, ({ on
     formResponse: one(formResponses, { fields: [conversationalFlows.formResponseId], references: [formResponses.id] }),
     eventType: one(eventTypes, { fields: [conversationalFlows.eventTypeId], references: [eventTypes.id] }),
     booking: one(bookings, { fields: [conversationalFlows.bookingId], references: [bookings.id] }),
-    approver: one(user, { fields: [conversationalFlows.approvedBy], references: [user.id] }),
+    approver: one(users, { fields: [conversationalFlows.approvedBy], references: [users.id] }), // Updated reference
+    organization: one(organizations, { fields: [conversationalFlows.organizationId], references: [organizations.id] }),
 
     // Child tables
     events: many(flowEvents),
@@ -656,12 +673,36 @@ export const schedulingRecommendationTranslationsRelations = relations(schedulin
 }));
 
 export const flowTemplatesRelations = relations(flowTemplates, ({ one, many }) => ({
-    creator: one(user, {
+    creator: one(users, {
         fields: [flowTemplates.createdBy],
-        references: [user.id]
+        references: [users.id]
+    }),
+    organization: one(organizations, {
+        fields: [flowTemplates.organizationId],
+        references: [organizations.id]
     }),
     defaultLanguageRef: one(supportedLanguages, {
         fields: [flowTemplates.defaultLanguage],
+        references: [supportedLanguages.code]
+    }),
+    translations: many(flowTemplateTranslations),
+}));
+
+export const flowTemplateTranslationsRelations = relations(flowTemplateTranslations, ({ one }) => ({
+    template: one(flowTemplates, {
+        fields: [flowTemplateTranslations.templateId],
+        references: [flowTemplates.id]
+    }),
+    translator: one(users, {
+        fields: [flowTemplateTranslations.translatedBy],
+        references: [users.id]
+    }),
+    reviewer: one(users, {
+        fields: [flowTemplateTranslations.reviewedBy],
+        references: [users.id]
+    }),
+    language: one(supportedLanguages, {
+        fields: [flowTemplateTranslations.languageCode],
         references: [supportedLanguages.code]
     }),
 }));

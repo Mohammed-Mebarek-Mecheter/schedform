@@ -13,10 +13,10 @@ import {
     varchar,
 } from "drizzle-orm/pg-core";
 import { relations, sql } from "drizzle-orm";
-import {user} from "@/db/schema/auth";
-import {formResponses, forms} from "@/db/schema/forms";
-import {bookings} from "@/db/schema/scheduling";
-import {supportedLanguages} from "@/db/schema/localization";
+import { users, organizations, teams } from "@/db/schema/auth";
+import { formResponses, forms } from "@/db/schema/forms";
+import { bookings } from "@/db/schema/scheduling";
+import { supportedLanguages } from "@/db/schema/localization";
 
 /**
  * Enums for spam prevention and quality control
@@ -49,8 +49,7 @@ export const reviewStatusEnum = pgEnum("review_status", [
     "auto_approved",
     "requires_human",
 ]);
-
-export const fraudIndicatorEnum = pgEnum("fraud_indicator", [
+pgEnum("fraud_indicator", [
     "suspicious_email",
     "disposable_email",
     "vpn_usage",
@@ -99,7 +98,8 @@ export const spamDetectionRules = pgTable(
     "spam_detection_rules",
     {
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        userId: text("user_id").references(() => user.id, { onDelete: "cascade" }),
+        userId: text("user_id").references(() => users.id, { onDelete: "cascade" }),
+        organizationId: text("organization_id").references(() => organizations.id, { onDelete: "cascade" }),
         formId: text("form_id").references(() => forms.id, { onDelete: "cascade" }),
 
         name: text("name").notNull(),
@@ -132,8 +132,8 @@ export const spamDetectionRules = pgTable(
         lastTriggered: timestamp("last_triggered", { mode: "date" }),
 
         // Management
-        createdBy: text("created_by").references(() => user.id, { onDelete: "set null" }),
-        lastModifiedBy: text("last_modified_by").references(() => user.id, { onDelete: "set null" }),
+        createdBy: text("created_by").references(() => users.id, { onDelete: "set null" }),
+        lastModifiedBy: text("last_modified_by").references(() => users.id, { onDelete: "set null" }),
 
         createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
         updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
@@ -143,10 +143,11 @@ export const spamDetectionRules = pgTable(
         idxActiveGlobal: index("spam_detection_rules_active_global_idx")
             .on(t.isActive, t.isGlobal)
             .where(sql`${t.isActive} = true`),
-        idxUserForm: index("spam_detection_rules_user_form_idx")
-            .on(t.userId, t.formId)
-            .where(sql`${t.userId} IS NOT NULL OR ${t.formId} IS NOT NULL`),
+        idxUserOrgForm: index("spam_detection_rules_user_org_form_idx")
+            .on(t.userId, t.organizationId, t.formId)
+            .where(sql`${t.userId} IS NOT NULL OR ${t.organizationId} IS NOT NULL OR ${t.formId} IS NOT NULL`),
         idxRuleType: index("spam_detection_rules_type_idx").on(t.ruleType, t.isActive),
+        idxOrgActive: index("spam_detection_rules_org_active_idx").on(t.organizationId, t.isActive),
 
         // Constraints
         chkSeverity: sql`CHECK (${t.severity} >= 1 AND ${t.severity} <= 10)`,
@@ -168,6 +169,7 @@ export const spamAssessments = pgTable(
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
         formResponseId: text("form_response_id").references(() => formResponses.id, { onDelete: "cascade" }),
         bookingId: text("booking_id").references(() => bookings.id, { onDelete: "cascade" }),
+        organizationId: text("organization_id").references(() => organizations.id, { onDelete: "cascade" }),
 
         // Overall assessment
         spamScore: integer("spam_score").notNull(),
@@ -203,7 +205,7 @@ export const spamAssessments = pgTable(
         requiresReview: boolean("requires_review").notNull().default(false),
         reviewStatus: reviewStatusEnum("review_status"),
         reviewPriority: integer("review_priority").default(5),
-        reviewedBy: text("reviewed_by").references(() => user.id, { onDelete: "set null" }),
+        reviewedBy: text("reviewed_by").references(() => users.id, { onDelete: "set null" }),
         reviewedAt: timestamp("reviewed_at", { mode: "date" }),
         reviewNotes: text("review_notes"),
         reviewDecision: text("review_decision"),
@@ -229,7 +231,7 @@ export const spamAssessments = pgTable(
         // Indexes
         idxFormResponse: index("spam_assessments_form_response_idx").on(t.formResponseId).where(sql`${t.formResponseId} IS NOT NULL`),
         idxBooking: index("spam_assessments_booking_idx").on(t.bookingId).where(sql`${t.bookingId} IS NOT NULL`),
-        idxSpamRisk: index("spam_assessments_spam_risk_idx").on(t.spamScore, t.riskLevel, t.isSpam),
+        idxOrgSpamRisk: index("spam_assessments_org_spam_risk_idx").on(t.organizationId, t.spamScore, t.riskLevel, t.isSpam),
         idxReviewRequired: index("spam_assessments_review_required_idx").on(t.requiresReview, t.reviewStatus).where(sql`${t.requiresReview} = true`),
         idxCreatedScore: index("spam_assessments_created_score_idx").on(t.createdAt, t.spamScore),
 
@@ -256,6 +258,7 @@ export const emailVerifications = pgTable(
         formResponseId: text("form_response_id").references(() => formResponses.id, { onDelete: "cascade" }),
         bookingId: text("booking_id").references(() => bookings.id, { onDelete: "cascade" }),
         spamAssessmentId: text("spam_assessment_id").references(() => spamAssessments.id, { onDelete: "cascade" }),
+        organizationId: text("organization_id").references(() => organizations.id, { onDelete: "cascade" }),
 
         email: text("email").notNull(),
         verificationToken: text("verification_token").notNull(),
@@ -318,6 +321,7 @@ export const emailVerifications = pgTable(
         idxEmail: index("email_verifications_email_idx").on(t.email),
         idxStatusExpiry: index("email_verifications_status_expiry_idx").on(t.status, t.expiresAt),
         idxDeliveryStatus: index("email_verifications_delivery_idx").on(t.deliveryStatus, t.createdAt),
+        idxOrgStatus: index("email_verifications_org_status_idx").on(t.organizationId, t.status),
 
         // Constraints
         chkEmailFormat: sql`CHECK (${t.email} ~ '^[^@]+@[^@]+\\.[^@]+')`,
@@ -344,6 +348,7 @@ export const smsVerifications = pgTable(
             .references(() => bookings.id, { onDelete: "cascade" }),
         spamAssessmentId: text("spam_assessment_id")
             .references(() => spamAssessments.id, { onDelete: "cascade" }),
+        organizationId: text("organization_id").references(() => organizations.id, { onDelete: "cascade" }),
 
         phone: text("phone").notNull(),
         normalizedPhone: text("normalized_phone").notNull(), // E.164 format
@@ -411,6 +416,7 @@ export const smsVerifications = pgTable(
             .where(sql`${t.phoneCarrier} IS NOT NULL`),
         idxDeliveryStatus: index("sms_verifications_delivery_idx")
             .on(t.deliveryStatus, t.createdAt),
+        idxOrgStatus: index("sms_verifications_org_status_idx").on(t.organizationId, t.status),
 
         // Constraints
         chkAttempts: sql`CHECK (${t.attempts} >= 0)`,
@@ -430,6 +436,8 @@ export const blockedEntities = pgTable(
     "blocked_entities",
     {
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
+        organizationId: text("organization_id").references(() => organizations.id, { onDelete: "cascade" }),
+        teamId: text("team_id").references(() => teams.id, { onDelete: "cascade" }),
 
         entityType: text("entity_type").notNull(), // ip, email, phone, domain, user_agent
         entityValue: text("entity_value").notNull(),
@@ -474,11 +482,11 @@ export const blockedEntities = pgTable(
         appealReason: text("appeal_reason"),
         appealStatus: text("appeal_status"), // pending, approved, rejected
         reviewedBy: text("reviewed_by")
-            .references(() => user.id, { onDelete: "set null" }),
+            .references(() => users.id, { onDelete: "set null" }),
 
         // Management
         blockedBy: text("blocked_by")
-            .references(() => user.id, { onDelete: "set null" }),
+            .references(() => users.id, { onDelete: "set null" }),
         isActive: boolean("is_active").notNull().default(true),
 
         // External data
@@ -500,6 +508,7 @@ export const blockedEntities = pgTable(
         idxCountrySeverity: index("blocked_entities_country_severity_idx")
             .on(t.country, t.severity)
             .where(sql`${t.country} IS NOT NULL`),
+        idxOrgTeam: index("blocked_entities_org_team_idx").on(t.organizationId, t.teamId),
 
         // Constraints
         chkSeverity: sql`CHECK (${t.severity} >= 1 AND ${t.severity} <= 10)`,
@@ -519,7 +528,9 @@ export const spamPreventionAnalytics = pgTable(
 
         date: timestamp("date", { mode: "date" }).notNull(),
         userId: text("user_id")
-            .references(() => user.id, { onDelete: "cascade" }),
+            .references(() => users.id, { onDelete: "cascade" }),
+        organizationId: text("organization_id")
+            .references(() => organizations.id, { onDelete: "cascade" }),
         formId: text("form_id")
             .references(() => forms.id, { onDelete: "cascade" }),
 
@@ -566,9 +577,9 @@ export const spamPreventionAnalytics = pgTable(
         createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
     },
     (t) => ({
-        uqDateUser: uniqueIndex("spam_prevention_analytics_date_user_uq")
-            .on(t.date, t.userId)
-            .where(sql`${t.userId} IS NOT NULL`),
+        uqDateOrg: uniqueIndex("spam_prevention_analytics_date_org_uq")
+            .on(t.date, t.organizationId)
+            .where(sql`${t.organizationId} IS NOT NULL`),
         uqDateForm: uniqueIndex("spam_prevention_analytics_date_form_uq")
             .on(t.date, t.formId)
             .where(sql`${t.formId} IS NOT NULL`),
@@ -576,6 +587,7 @@ export const spamPreventionAnalytics = pgTable(
             .on(t.date),
         idxAccuracy: index("spam_prevention_analytics_accuracy_idx")
             .on(t.spamDetectionAccuracy, t.date),
+        idxOrgDate: index("spam_prevention_analytics_org_date_idx").on(t.organizationId, t.date),
 
         // Constraints
         chkTotalSubmissions: sql`CHECK (${t.totalSubmissions} >= 0)`,
@@ -723,91 +735,218 @@ export const regionalSpamRules = pgTable(
    ============================ */
 
 export const spamDetectionRulesRelations = relations(spamDetectionRules, ({ one, many }) => ({
-    owner: one(user, { fields: [spamDetectionRules.userId], references: [user.id] }),
-    form: one(forms, { fields: [spamDetectionRules.formId], references: [forms.id] }),
-    creator: one(user, { fields: [spamDetectionRules.createdBy], references: [user.id] }),
-    lastModifier: one(user, { fields: [spamDetectionRules.lastModifiedBy], references: [user.id] }),
-    regionalRules: many(regionalSpamRules),
+    owner: one(users, {
+        fields: [spamDetectionRules.userId],
+        references: [users.id],
+        relationName: "spam_detection_rule_owner"
+    }),
+    organization: one(organizations, {
+        fields: [spamDetectionRules.organizationId],
+        references: [organizations.id],
+        relationName: "spam_detection_rule_organization"
+    }),
+    form: one(forms, {
+        fields: [spamDetectionRules.formId],
+        references: [forms.id],
+        relationName: "spam_detection_rule_form"
+    }),
+    creator: one(users, {
+        fields: [spamDetectionRules.createdBy],
+        references: [users.id],
+        relationName: "spam_detection_rule_creator"
+    }),
+    lastModifier: one(users, {
+        fields: [spamDetectionRules.lastModifiedBy],
+        references: [users.id],
+        relationName: "spam_detection_rule_modifier"
+    }),
+    regionalRules: many(regionalSpamRules, {
+        relationName: "spam_detection_rule_regional_rules"
+    }),
 }));
 
 export const spamAssessmentsRelations = relations(spamAssessments, ({ one, many }) => ({
-    formResponse: one(formResponses, { fields: [spamAssessments.formResponseId], references: [formResponses.id] }),
-    booking: one(bookings, { fields: [spamAssessments.bookingId], references: [bookings.id] }),
-    reviewer: one(user, { fields: [spamAssessments.reviewedBy], references: [user.id] }),
-    translations: many(spamAssessmentTranslations),
+    formResponse: one(formResponses, {
+        fields: [spamAssessments.formResponseId],
+        references: [formResponses.id],
+        relationName: "spam_assessment_form_response"
+    }),
+    booking: one(bookings, {
+        fields: [spamAssessments.bookingId],
+        references: [bookings.id],
+        relationName: "spam_assessment_booking"
+    }),
+    organization: one(organizations, {
+        fields: [spamAssessments.organizationId],
+        references: [organizations.id],
+        relationName: "spam_assessment_organization"
+    }),
+    reviewer: one(users, {
+        fields: [spamAssessments.reviewedBy],
+        references: [users.id],
+        relationName: "spam_assessment_reviewer"
+    }),
+    translations: many(spamAssessmentTranslations, {
+        relationName: "spam_assessment_translations"
+    }),
+    // Assuming there might be a link to email/sms verifications if they reference this assessment
+    emailVerifications: many(emailVerifications, {
+        relationName: "spam_assessment_email_verifications"
+    }),
+    smsVerifications: many(smsVerifications, {
+        relationName: "spam_assessment_sms_verifications"
+    }),
 }));
 
 export const emailVerificationsRelations = relations(emailVerifications, ({ one }) => ({
-    formResponse: one(formResponses, { fields: [emailVerifications.formResponseId], references: [formResponses.id] }),
-    booking: one(bookings, { fields: [emailVerifications.bookingId], references: [bookings.id] }),
-    spamAssessment: one(spamAssessments, { fields: [emailVerifications.spamAssessmentId], references: [spamAssessments.id] }),
+    formResponse: one(formResponses, {
+        fields: [emailVerifications.formResponseId],
+        references: [formResponses.id],
+        relationName: "email_verification_form_response"
+    }),
+    booking: one(bookings, {
+        fields: [emailVerifications.bookingId],
+        references: [bookings.id],
+        relationName: "email_verification_booking"
+    }),
+    spamAssessment: one(spamAssessments, {
+        fields: [emailVerifications.spamAssessmentId],
+        references: [spamAssessments.id],
+        relationName: "email_verification_spam_assessment"
+    }),
+    organization: one(organizations, {
+        fields: [emailVerifications.organizationId],
+        references: [organizations.id],
+        relationName: "email_verification_organization"
+    }),
     detectedLanguageRef: one(supportedLanguages, {
         fields: [emailVerifications.detectedLanguage],
         references: [supportedLanguages.code],
+        relationName: "email_verification_detected_language"
     }),
     preferredLanguageRef: one(supportedLanguages, {
         fields: [emailVerifications.preferredLanguage],
         references: [supportedLanguages.code],
+        relationName: "email_verification_preferred_language"
     }),
 }));
 
 export const smsVerificationsRelations = relations(smsVerifications, ({ one }) => ({
-    formResponse: one(formResponses, { fields: [smsVerifications.formResponseId], references: [formResponses.id] }),
-    booking: one(bookings, { fields: [smsVerifications.bookingId], references: [bookings.id] }),
-    spamAssessment: one(spamAssessments, { fields: [smsVerifications.spamAssessmentId], references: [spamAssessments.id] }),
+    formResponse: one(formResponses, {
+        fields: [smsVerifications.formResponseId],
+        references: [formResponses.id],
+        relationName: "sms_verification_form_response"
+    }),
+    booking: one(bookings, {
+        fields: [smsVerifications.bookingId],
+        references: [bookings.id],
+        relationName: "sms_verification_booking"
+    }),
+    spamAssessment: one(spamAssessments, {
+        fields: [smsVerifications.spamAssessmentId],
+        references: [spamAssessments.id],
+        relationName: "sms_verification_spam_assessment"
+    }),
+    organization: one(organizations, {
+        fields: [smsVerifications.organizationId],
+        references: [organizations.id],
+        relationName: "sms_verification_organization"
+    }),
     detectedLanguageRef: one(supportedLanguages, {
         fields: [smsVerifications.detectedLanguage],
         references: [supportedLanguages.code],
+        relationName: "sms_verification_detected_language"
     }),
     preferredLanguageRef: one(supportedLanguages, {
         fields: [smsVerifications.preferredLanguage],
         references: [supportedLanguages.code],
+        relationName: "sms_verification_preferred_language"
     }),
 }));
 
 export const blockedEntitiesRelations = relations(blockedEntities, ({ one, many }) => ({
-    blockedBy: one(user, { fields: [blockedEntities.blockedBy], references: [user.id] }),
-    reviewedBy: one(user, { fields: [blockedEntities.reviewedBy], references: [user.id] }),
-    translations: many(blockedEntityTranslations),
+    organization: one(organizations, {
+        fields: [blockedEntities.organizationId],
+        references: [organizations.id],
+        relationName: "blocked_entity_organization"
+    }),
+    team: one(teams, {
+        fields: [blockedEntities.teamId],
+        references: [teams.id],
+        relationName: "blocked_entity_team"
+    }),
+    blockedBy: one(users, {
+        fields: [blockedEntities.blockedBy],
+        references: [users.id],
+        relationName: "blocked_entity_blocked_by"
+    }),
+    reviewedBy: one(users, {
+        fields: [blockedEntities.reviewedBy],
+        references: [users.id],
+        relationName: "blocked_entity_reviewed_by"
+    }),
+    translations: many(blockedEntityTranslations, {
+        relationName: "blocked_entity_translations"
+    }),
 }));
 
 export const spamPreventionAnalyticsRelations = relations(spamPreventionAnalytics, ({ one }) => ({
-    user: one(user, { fields: [spamPreventionAnalytics.userId], references: [user.id] }),
-    form: one(forms, { fields: [spamPreventionAnalytics.formId], references: [forms.id] }),
+    user: one(users, {
+        fields: [spamPreventionAnalytics.userId],
+        references: [users.id],
+        relationName: "spam_analytics_user"
+    }),
+    organization: one(organizations, {
+        fields: [spamPreventionAnalytics.organizationId],
+        references: [organizations.id],
+        relationName: "spam_analytics_organization"
+    }),
+    form: one(forms, {
+        fields: [spamPreventionAnalytics.formId],
+        references: [forms.id],
+        relationName: "spam_analytics_form"
+    }),
 }));
 
+// These relations for translation tables seem mostly correct, assuming `supportedLanguages` is imported correctly.
 export const verificationMessageTranslationsRelations = relations(verificationMessageTranslations, ({ one }) => ({
     language: one(supportedLanguages, {
         fields: [verificationMessageTranslations.languageCode],
-        references: [supportedLanguages.code]
+        references: [supportedLanguages.code],
+        relationName: "verification_message_language"
     }),
 }));
 
 export const spamAssessmentTranslationsRelations = relations(spamAssessmentTranslations, ({ one }) => ({
     assessment: one(spamAssessments, {
         fields: [spamAssessmentTranslations.assessmentId],
-        references: [spamAssessments.id]
+        references: [spamAssessments.id],
+        relationName: "spam_assessment_translation_assessment"
     }),
     language: one(supportedLanguages, {
         fields: [spamAssessmentTranslations.languageCode],
-        references: [supportedLanguages.code]
+        references: [supportedLanguages.code],
+        relationName: "spam_assessment_translation_language"
     }),
 }));
 
 export const blockedEntityTranslationsRelations = relations(blockedEntityTranslations, ({ one }) => ({
     blockedEntity: one(blockedEntities, {
         fields: [blockedEntityTranslations.blockedEntityId],
-        references: [blockedEntities.id]
+        references: [blockedEntities.id],
+        relationName: "blocked_entity_translation_entity"
     }),
     language: one(supportedLanguages, {
         fields: [blockedEntityTranslations.languageCode],
-        references: [supportedLanguages.code]
+        references: [supportedLanguages.code],
+        relationName: "blocked_entity_translation_language"
     }),
 }));
 
 export const regionalSpamRulesRelations = relations(regionalSpamRules, ({ one }) => ({
     rule: one(spamDetectionRules, {
         fields: [regionalSpamRules.ruleId],
-        references: [spamDetectionRules.id]
+        references: [spamDetectionRules.id],
+        relationName: "regional_spam_rule_parent"
     }),
 }));

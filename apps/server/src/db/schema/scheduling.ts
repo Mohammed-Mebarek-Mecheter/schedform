@@ -13,9 +13,9 @@ import {
     real
 } from "drizzle-orm/pg-core";
 import { relations, sql } from "drizzle-orm";
-import {user} from "@/db/schema/auth";
-import {formResponses, forms} from "@/db/schema/forms";
-import {eventTypeTranslations, supportedLanguages} from "@/db/schema/localization";
+import { users, organizations, teams } from "@/db/schema/auth";
+import { formResponses, forms } from "@/db/schema/forms";
+import { eventTypeTranslations, supportedLanguages } from "@/db/schema/localization";
 
 /* ============================
    Enums (Postgres pg_enum types)
@@ -67,16 +67,20 @@ export const noShowReasonEnum = pgEnum("no_show_reason", [
    ============================ */
 
 /**
- * Calendar connections - per-user calendar OAuth connections
+ * Calendar connections - per-user calendar OAuth connections with organization context
  */
-
 export const calendarConnections = pgTable(
     "calendar_connections",
     {
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
         userId: text("user_id")
             .notNull()
-            .references(() => user.id, { onDelete: "cascade" }),
+            .references(() => users.id, { onDelete: "cascade" }),
+        organizationId: text("organization_id")
+            .notNull()
+            .references(() => organizations.id, { onDelete: "cascade" }),
+        teamId: text("team_id")
+            .references(() => teams.id, { onDelete: "set null" }),
         provider: calendarProviderEnum("provider").notNull(),
         name: text("name").notNull(),
         email: text("email").notNull(),
@@ -87,16 +91,21 @@ export const calendarConnections = pgTable(
         timeZone: text("time_zone").notNull(),
         isDefault: boolean("is_default").notNull().default(false),
         isActive: boolean("is_active").notNull().default(true),
+        isPersonal: boolean("is_personal").notNull().default(false),
         lastSyncAt: timestamp("last_sync_at", { mode: "date" }),
         syncStatus: text("sync_status").notNull().default("pending"),
         syncErrors: jsonb("sync_errors"),
         totalBookings: integer("total_bookings").notNull().default(0),
         failedSyncs: integer("failed_syncs").notNull().default(0),
+        permissions: jsonb("permissions"), // Access permissions for team/organization
+        metadata: jsonb("metadata"), // Additional provider-specific metadata
         createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
         updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
     },
     (t) => ({
         idxUser: index("calendar_connections_user_idx").on(t.userId),
+        idxOrganization: index("calendar_connections_organization_idx").on(t.organizationId),
+        idxTeam: index("calendar_connections_team_idx").on(t.teamId).where(sql`${t.teamId} IS NOT NULL`),
         uqUserDefault: uniqueIndex("calendar_connections_user_default_uq")
             .on(t.userId, t.isDefault)
             .where(sql`${t.isDefault} = true`),
@@ -106,7 +115,7 @@ export const calendarConnections = pgTable(
 );
 
 /**
- * Event types - meeting templates with proper validation
+ * Event types - meeting templates with organization and team context
  */
 export const eventTypes = pgTable(
     "event_types",
@@ -114,7 +123,12 @@ export const eventTypes = pgTable(
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
         userId: text("user_id")
             .notNull()
-            .references(() => user.id, { onDelete: "restrict" }),
+            .references(() => users.id, { onDelete: "restrict" }),
+        organizationId: text("organization_id")
+            .notNull()
+            .references(() => organizations.id, { onDelete: "cascade" }),
+        teamId: text("team_id")
+            .references(() => teams.id, { onDelete: "set null" }),
         formId: text("form_id").references(() => forms.id, { onDelete: "set null" }),
         title: text("title").notNull(),
         description: text("description"),
@@ -161,6 +175,10 @@ export const eventTypes = pgTable(
         noShowRate: real("no_show_rate").notNull().default(0),
         averageQualificationScore: real("average_qualification_score").notNull().default(0),
         isActive: boolean("is_active").notNull().default(true),
+        isTemplate: boolean("is_template").notNull().default(false),
+        visibility: text("visibility").notNull().default("private"), // private, team, organization, public
+        permissions: jsonb("permissions"), // Fine-grained access control
+        metadata: jsonb("metadata"),
         archivedAt: timestamp("archived_at", { mode: "date" }),
         createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
         updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
@@ -168,6 +186,8 @@ export const eventTypes = pgTable(
     (t) => ({
         uqSlug: uniqueIndex("event_types_slug_uq").on(t.slug),
         idxUserActive: index("event_types_user_active_idx").on(t.userId, t.isActive),
+        idxOrganization: index("event_types_organization_idx").on(t.organizationId),
+        idxTeam: index("event_types_team_idx").on(t.teamId).where(sql`${t.teamId} IS NOT NULL`),
         idxForm: index("event_types_form_idx").on(t.formId).where(sql`${t.formId} IS NOT NULL`),
 
         // ✅ move checks here
@@ -184,11 +204,12 @@ export const eventTypes = pgTable(
         chkTotals: sql`CHECK (${t.totalBookings} >= 0 AND ${t.completedBookings} >= 0)`,
         chkNoShowRate: sql`CHECK (${t.noShowRate} >= 0 AND ${t.noShowRate} <= 100)`,
         chkAvgQualScore: sql`CHECK (${t.averageQualificationScore} >= 0 AND ${t.averageQualificationScore} <= 100)`,
+        chkVisibility: sql`CHECK (${t.visibility} IN ('private', 'team', 'organization', 'public'))`,
     }),
 );
 
 /**
- * Availability slots - optimized indexing
+ * Availability slots - optimized indexing with organization context
  */
 export const availabilitySlots = pgTable(
     "availability_slots",
@@ -200,6 +221,9 @@ export const availabilitySlots = pgTable(
         calendarConnectionId: text("calendar_connection_id")
             .notNull()
             .references(() => calendarConnections.id, { onDelete: "cascade" }),
+        organizationId: text("organization_id")
+            .notNull()
+            .references(() => organizations.id, { onDelete: "cascade" }),
 
         startTime: timestamp("start_time", { mode: "date" }).notNull(),
         endTime: timestamp("end_time", { mode: "date" }).notNull(),
@@ -214,6 +238,7 @@ export const availabilitySlots = pgTable(
         maxBookings: integer("max_bookings").default(1),
         currentBookings: integer("current_bookings").default(0),
 
+        metadata: jsonb("metadata"), // Additional slot metadata
         createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
         updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
     },
@@ -224,6 +249,7 @@ export const availabilitySlots = pgTable(
             t.calendarConnectionId,
             t.startTime,
         ),
+        idxOrganization: index("availability_slots_organization_idx").on(t.organizationId),
         uqCalendarSlot: uniqueIndex("availability_slots_calendar_time_uq").on(
             t.calendarConnectionId,
             t.startTime,
@@ -235,7 +261,7 @@ export const availabilitySlots = pgTable(
 );
 
 /**
- * Availability rules - simplified indexing
+ * Availability rules - simplified indexing with organization context
  */
 export const availabilityRules = pgTable(
     "availability_rules",
@@ -243,7 +269,11 @@ export const availabilityRules = pgTable(
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
         userId: text("user_id")
             .notNull()
-            .references(() => user.id, { onDelete: "cascade" }),
+            .references(() => users.id, { onDelete: "cascade" }),
+        organizationId: text("organization_id")
+            .notNull()
+            .references(() => organizations.id, { onDelete: "cascade" }),
+        teamId: text("team_id").references(() => teams.id, { onDelete: "cascade" }),
         eventTypeId: text("event_type_id").references(() => eventTypes.id, {
             onDelete: "cascade",
         }),
@@ -262,6 +292,7 @@ export const availabilityRules = pgTable(
         exceptions: jsonb("exceptions"),
 
         isActive: boolean("is_active").notNull().default(true),
+        priority: integer("priority").default(1), // Rule priority for conflict resolution
 
         createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
         updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
@@ -271,6 +302,7 @@ export const availabilityRules = pgTable(
             t.userId,
             t.isActive,
         ),
+        idxOrganization: index("availability_rules_organization_idx").on(t.organizationId),
         idxEventType: index("availability_rules_event_type_idx")
             .on(t.eventTypeId)
             .where(sql`${t.eventTypeId} IS NOT NULL`),
@@ -280,11 +312,12 @@ export const availabilityRules = pgTable(
         ),
         chkDayOfWeek: sql`CHECK (${t.dayOfWeek} >= 0 AND ${t.dayOfWeek} <= 6)`,
         chkMaxBookingsPerSlot: sql`CHECK (${t.maxBookingsPerSlot} > 0)`,
+        chkPriority: sql`CHECK (${t.priority} >= 1 AND ${t.priority} <= 10)`,
     }),
 );
 
 /**
- * Blocked times - optimized
+ * Blocked times - optimized with organization context
  */
 export const blockedTimes = pgTable(
     "blocked_times",
@@ -292,7 +325,10 @@ export const blockedTimes = pgTable(
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
         userId: text("user_id")
             .notNull()
-            .references(() => user.id, { onDelete: "cascade" }),
+            .references(() => users.id, { onDelete: "cascade" }),
+        organizationId: text("organization_id")
+            .notNull()
+            .references(() => organizations.id, { onDelete: "cascade" }),
         calendarConnectionId: text("calendar_connection_id").references(
             () => calendarConnections.id,
             { onDelete: "cascade" },
@@ -317,6 +353,7 @@ export const blockedTimes = pgTable(
             .default(false),
         lastSyncedAt: timestamp("last_synced_at", { mode: "date" }),
 
+        metadata: jsonb("metadata"),
         createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
         updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
     },
@@ -326,6 +363,7 @@ export const blockedTimes = pgTable(
             t.startTime,
             t.endTime,
         ),
+        idxOrganization: index("blocked_times_organization_idx").on(t.organizationId),
         idxCalendarTime: index("blocked_times_calendar_time_idx")
             .on(t.calendarConnectionId, t.startTime)
             .where(sql`${t.calendarConnectionId} IS NOT NULL`),
@@ -334,7 +372,7 @@ export const blockedTimes = pgTable(
 );
 
 /**
- * Bookings - comprehensive with proper validation
+ * Bookings - comprehensive with proper validation and organization context
  */
 export const bookings = pgTable(
     "bookings",
@@ -349,6 +387,10 @@ export const bookings = pgTable(
         calendarConnectionId: text("calendar_connection_id")
             .notNull()
             .references(() => calendarConnections.id, { onDelete: "restrict" }),
+        organizationId: text("organization_id")
+            .notNull()
+            .references(() => organizations.id, { onDelete: "cascade" }),
+        teamId: text("team_id").references(() => teams.id, { onDelete: "set null" }),
 
         startTime: timestamp("start_time", { mode: "date" }).notNull(),
         endTime: timestamp("end_time", { mode: "date" }).notNull(),
@@ -433,6 +475,11 @@ export const bookings = pgTable(
         localizedMeetingDetails: jsonb("localized_meeting_details"), // Meeting info in guest's language
         localizedPreparationTips: jsonb("localized_preparation_tips"),
 
+        // Organization and team context
+        assignedUserId: text("assigned_user_id").references(() => users.id, { onDelete: "set null" }),
+        permissions: jsonb("permissions"), // Booking-specific permissions
+        metadata: jsonb("metadata"), // Additional booking metadata
+
         createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
         updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
     },
@@ -445,9 +492,12 @@ export const bookings = pgTable(
             t.startTime,
             t.status,
         ),
+        idxOrganization: index("bookings_organization_idx").on(t.organizationId),
+        idxTeam: index("bookings_team_idx").on(t.teamId).where(sql`${t.teamId} IS NOT NULL`),
         idxGuestEmail: index("bookings_guest_email_idx").on(t.guestEmail),
         idxStartTime: index("bookings_start_time_idx").on(t.startTime),
         idxCreated: index("bookings_created_idx").on(t.createdAt),
+        idxAssignedUser: index("bookings_assigned_user_idx").on(t.assignedUserId).where(sql`${t.assignedUserId} IS NOT NULL`),
 
         chkGuestEmail: sql`CHECK (${t.guestEmail} ~ '^[^@]+@[^@]+\\.[^@]+')`,
         chkMeetingUrl: sql`CHECK (${t.meetingUrl} IS NULL OR ${t.meetingUrl} ~ '^https?://')`,
@@ -461,7 +511,7 @@ export const bookings = pgTable(
 );
 
 /**
- * Booking reminders - simplified
+ * Booking reminders - simplified with organization context
  */
 export const bookingReminders = pgTable(
     "booking_reminders",
@@ -470,6 +520,9 @@ export const bookingReminders = pgTable(
         bookingId: text("booking_id")
             .notNull()
             .references(() => bookings.id, { onDelete: "cascade" }),
+        organizationId: text("organization_id")
+            .notNull()
+            .references(() => organizations.id, { onDelete: "cascade" }),
 
         type: text("type").notNull(), // 'email' | 'sms' | 'both' | 'push'
         triggerMinutes: integer("trigger_minutes").notNull(), // Minutes before meeting
@@ -496,6 +549,7 @@ export const bookingReminders = pgTable(
         externalId: text("external_id"),
         deliveryStatus: text("delivery_status"),
 
+        metadata: jsonb("metadata"),
         createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
     },
     (t) => ({
@@ -503,6 +557,7 @@ export const bookingReminders = pgTable(
             t.bookingId,
             t.triggerMinutes,
         ),
+        idxOrganization: index("booking_reminders_organization_idx").on(t.organizationId),
         idxStatusPending: index("booking_reminders_status_pending_idx")
             .on(t.status, t.sentAt)
             .where(sql`${t.status} = 'pending'`),
@@ -511,7 +566,7 @@ export const bookingReminders = pgTable(
 );
 
 /**
- * Meeting feedback - enhanced tracking
+ * Meeting feedback - enhanced tracking with organization context
  */
 export const meetingFeedback = pgTable(
     "meeting_feedback",
@@ -520,6 +575,9 @@ export const meetingFeedback = pgTable(
         bookingId: text("booking_id")
             .notNull()
             .references(() => bookings.id, { onDelete: "cascade" }),
+        organizationId: text("organization_id")
+            .notNull()
+            .references(() => organizations.id, { onDelete: "cascade" }),
 
         // Ratings
         hostRating: integer("host_rating"),
@@ -551,11 +609,16 @@ export const meetingFeedback = pgTable(
         aiMeetingSummary: text("ai_meeting_summary"),
         aiNextStepsRecommendation: text("ai_next_steps_recommendation"),
 
+        // Organization context
+        reviewerUserId: text("reviewer_user_id").references(() => users.id, { onDelete: "set null" }),
+        metadata: jsonb("metadata"),
+
         createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
         updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
     },
     (t) => ({
         uqBooking: uniqueIndex("meeting_feedback_booking_uq").on(t.bookingId),
+        idxOrganization: index("meeting_feedback_organization_idx").on(t.organizationId),
         idxOutcome: index("meeting_feedback_outcome_idx")
             .on(t.outcome)
             .where(sql`${t.outcome} IS NOT NULL`),
@@ -571,7 +634,7 @@ export const meetingFeedback = pgTable(
 );
 
 /**
- * Team assignments - simplified for performance
+ * Team assignments - simplified for performance with organization context
  */
 export const teamAssignments = pgTable(
     "team_assignments",
@@ -582,7 +645,11 @@ export const teamAssignments = pgTable(
             .references(() => eventTypes.id, { onDelete: "cascade" }),
         userId: text("user_id")
             .notNull()
-            .references(() => user.id, { onDelete: "cascade" }),
+            .references(() => users.id, { onDelete: "cascade" }),
+        organizationId: text("organization_id")
+            .notNull()
+            .references(() => organizations.id, { onDelete: "cascade" }),
+        teamId: text("team_id").references(() => teams.id, { onDelete: "cascade" }),
 
         // Assignment configuration
         weight: integer("weight").notNull().default(1),
@@ -606,6 +673,10 @@ export const teamAssignments = pgTable(
         averageRating: real("average_rating").notNull().default(0),
         lastAssignedAt: timestamp("last_assigned_at", { mode: "date" }),
 
+        // Permissions and metadata
+        permissions: jsonb("permissions"),
+        metadata: jsonb("metadata"),
+
         createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
         updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
     },
@@ -614,6 +685,7 @@ export const teamAssignments = pgTable(
             t.eventTypeId,
             t.userId,
         ),
+        idxOrganization: index("team_assignments_organization_idx").on(t.organizationId),
         idxActive: index("team_assignments_active_idx")
             .on(t.isActive, t.weight)
             .where(sql`${t.isActive} = true`),
@@ -628,7 +700,7 @@ export const teamAssignments = pgTable(
 );
 
 /**
- * Booking analytics - daily aggregates for performance
+ * Booking analytics - daily aggregates for performance with organization context
  */
 export const bookingAnalytics = pgTable(
     "booking_analytics",
@@ -637,9 +709,13 @@ export const bookingAnalytics = pgTable(
         eventTypeId: text("event_type_id")
             .notNull()
             .references(() => eventTypes.id, { onDelete: "cascade" }),
-        userId: text("user_id").references(() => user.id, {
+        userId: text("user_id").references(() => users.id, {
             onDelete: "cascade",
         }),
+        organizationId: text("organization_id")
+            .notNull()
+            .references(() => organizations.id, { onDelete: "cascade" }),
+        teamId: text("team_id").references(() => teams.id, { onDelete: "cascade" }),
 
         date: timestamp("date", { mode: "date" }).notNull(),
 
@@ -682,6 +758,9 @@ export const bookingAnalytics = pgTable(
         totalRevenue: real("total_revenue").notNull().default(0),
         averageBookingValue: real("average_booking_value").notNull().default(0),
 
+        // Organization context
+        metadata: jsonb("metadata"),
+
         createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
     },
     (t) => ({
@@ -690,6 +769,7 @@ export const bookingAnalytics = pgTable(
             t.date,
         ),
         idxDate: index("booking_analytics_date_idx").on(t.date),
+        idxOrganization: index("booking_analytics_organization_idx").on(t.organizationId),
         idxUser: index("booking_analytics_user_idx")
             .on(t.userId)
             .where(sql`${t.userId} IS NOT NULL`),
@@ -711,6 +791,9 @@ export const bookingReminderTranslations = pgTable(
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
         reminderId: text("reminder_id").notNull().references(() => bookingReminders.id, { onDelete: "cascade" }),
         languageCode: text("language_code").notNull().references(() => supportedLanguages.code, { onDelete: "restrict" }),
+        organizationId: text("organization_id")
+            .notNull()
+            .references(() => organizations.id, { onDelete: "cascade" }),
 
         // Localized reminder content
         subject: text("subject"),
@@ -726,6 +809,7 @@ export const bookingReminderTranslations = pgTable(
     (t) => ({
         uqReminderLanguage: uniqueIndex("booking_reminder_translations_reminder_language_uq").on(t.reminderId, t.languageCode),
         idxLanguage: index("booking_reminder_translations_language_idx").on(t.languageCode),
+        idxOrganization: index("booking_reminder_translations_organization_idx").on(t.organizationId),
     })
 );
 
@@ -736,6 +820,9 @@ export const meetingFeedbackTranslations = pgTable(
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
         feedbackId: text("feedback_id").notNull().references(() => meetingFeedback.id, { onDelete: "cascade" }),
         languageCode: text("language_code").notNull().references(() => supportedLanguages.code, { onDelete: "restrict" }),
+        organizationId: text("organization_id")
+            .notNull()
+            .references(() => organizations.id, { onDelete: "cascade" }),
 
         // Localized feedback content
         notes: text("notes"),
@@ -751,6 +838,7 @@ export const meetingFeedbackTranslations = pgTable(
     },
     (t) => ({
         uqFeedbackLanguage: uniqueIndex("meeting_feedback_translations_feedback_language_uq").on(t.feedbackId, t.languageCode),
+        idxOrganization: index("meeting_feedback_translations_organization_idx").on(t.organizationId),
     })
 );
 
@@ -759,6 +847,9 @@ export const bookingStatusMessages = pgTable(
     "booking_status_messages",
     {
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
+        organizationId: text("organization_id")
+            .notNull()
+            .references(() => organizations.id, { onDelete: "cascade" }),
 
         statusKey: text("status_key").notNull(), // "confirmed", "cancelled", "no_show", etc.
         languageCode: text("language_code").notNull().references(() => supportedLanguages.code, { onDelete: "restrict" }),
@@ -779,6 +870,7 @@ export const bookingStatusMessages = pgTable(
         uqStatusLanguage: uniqueIndex("booking_status_messages_status_language_uq").on(t.statusKey, t.languageCode),
         idxStatus: index("booking_status_messages_status_idx").on(t.statusKey),
         idxLanguage: index("booking_status_messages_language_idx").on(t.languageCode),
+        idxOrganization: index("booking_status_messages_organization_idx").on(t.organizationId),
     })
 );
 
@@ -787,6 +879,8 @@ export const timezoneTranslations = pgTable(
     "timezone_translations",
     {
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
+        organizationId: text("organization_id")
+            .references(() => organizations.id, { onDelete: "cascade" }),
 
         timezoneId: text("timezone_id").notNull(), // "America/New_York", "Europe/London", etc.
         languageCode: text("language_code").notNull().references(() => supportedLanguages.code, { onDelete: "restrict" }),
@@ -801,6 +895,7 @@ export const timezoneTranslations = pgTable(
         uqTimezoneLanguage: uniqueIndex("timezone_translations_timezone_language_uq").on(t.timezoneId, t.languageCode),
         idxTimezone: index("timezone_translations_timezone_idx").on(t.timezoneId),
         idxLanguage: index("timezone_translations_language_idx").on(t.languageCode),
+        idxOrganization: index("timezone_translations_organization_idx").on(t.organizationId).where(sql`${t.organizationId} IS NOT NULL`),
     })
 );
 
@@ -809,14 +904,18 @@ export const timezoneTranslations = pgTable(
    ============================ */
 
 export const calendarConnectionsRelations = relations(calendarConnections, ({ one, many }) => ({
-    user: one(user, { fields: [calendarConnections.userId], references: [user.id] }),
+    user: one(users, { fields: [calendarConnections.userId], references: [users.id] }),
+    organization: one(organizations, { fields: [calendarConnections.organizationId], references: [organizations.id] }),
+    team: one(teams, { fields: [calendarConnections.teamId], references: [teams.id] }),
     availabilitySlots: many(availabilitySlots),
     bookings: many(bookings),
     blockedTimes: many(blockedTimes),
 }));
 
 export const eventTypesRelations = relations(eventTypes, ({ one, many }) => ({
-    owner: one(user, { fields: [eventTypes.userId], references: [user.id] }),
+    owner: one(users, { fields: [eventTypes.userId], references: [users.id] }),
+    organization: one(organizations, { fields: [eventTypes.organizationId], references: [organizations.id] }),
+    team: one(teams, { fields: [eventTypes.teamId], references: [teams.id] }),
     form: one(forms, { fields: [eventTypes.formId], references: [forms.id] }),
     availabilitySlots: many(availabilitySlots),
     teamAssignments: many(teamAssignments),
@@ -836,15 +935,19 @@ export const availabilitySlotsRelations = relations(availabilitySlots, ({ one })
         fields: [availabilitySlots.calendarConnectionId],
         references: [calendarConnections.id],
     }),
+    organization: one(organizations, { fields: [availabilitySlots.organizationId], references: [organizations.id] }),
 }));
 
 export const availabilityRulesRelations = relations(availabilityRules, ({ one }) => ({
-    user: one(user, { fields: [availabilityRules.userId], references: [user.id] }),
+    user: one(users, { fields: [availabilityRules.userId], references: [users.id] }),
+    organization: one(organizations, { fields: [availabilityRules.organizationId], references: [organizations.id] }),
+    team: one(teams, { fields: [availabilityRules.teamId], references: [teams.id] }),
     eventType: one(eventTypes, { fields: [availabilityRules.eventTypeId], references: [eventTypes.id] }),
 }));
 
 export const blockedTimesRelations = relations(blockedTimes, ({ one }) => ({
-    user: one(user, { fields: [blockedTimes.userId], references: [user.id] }),
+    user: one(users, { fields: [blockedTimes.userId], references: [users.id] }),
+    organization: one(organizations, { fields: [blockedTimes.organizationId], references: [organizations.id] }),
     calendarConnection: one(calendarConnections, {
         fields: [blockedTimes.calendarConnectionId],
         references: [calendarConnections.id],
@@ -853,11 +956,14 @@ export const blockedTimesRelations = relations(blockedTimes, ({ one }) => ({
 
 export const bookingsRelations = relations(bookings, ({ one, many }) => ({
     eventType: one(eventTypes, { fields: [bookings.eventTypeId], references: [eventTypes.id] }),
+    organization: one(organizations, { fields: [bookings.organizationId], references: [organizations.id] }),
+    team: one(teams, { fields: [bookings.teamId], references: [teams.id] }),
     formResponse: one(formResponses, { fields: [bookings.formResponseId], references: [formResponses.id] }),
     calendarConnection: one(calendarConnections, {
         fields: [bookings.calendarConnectionId],
         references: [calendarConnections.id],
     }),
+    assignedUser: one(users, { fields: [bookings.assignedUserId], references: [users.id] }),
     reminders: many(bookingReminders),
     feedback: many(meetingFeedback),
     // Self-relation for reschedule tracking
@@ -877,22 +983,29 @@ export const bookingsRelations = relations(bookings, ({ one, many }) => ({
 
 export const bookingRemindersRelations = relations(bookingReminders, ({ one, many }) => ({
     booking: one(bookings, { fields: [bookingReminders.bookingId], references: [bookings.id] }),
+    organization: one(organizations, { fields: [bookingReminders.organizationId], references: [organizations.id] }),
     translations: many(bookingReminderTranslations),
 }));
 
 export const meetingFeedbackRelations = relations(meetingFeedback, ({ one, many }) => ({
     booking: one(bookings, { fields: [meetingFeedback.bookingId], references: [bookings.id] }),
+    organization: one(organizations, { fields: [meetingFeedback.organizationId], references: [organizations.id] }),
+    reviewerUser: one(users, { fields: [meetingFeedback.reviewerUserId], references: [users.id] }),
     translations: many(meetingFeedbackTranslations),
 }));
 
 export const teamAssignmentsRelations = relations(teamAssignments, ({ one }) => ({
     eventType: one(eventTypes, { fields: [teamAssignments.eventTypeId], references: [eventTypes.id] }),
-    user: one(user, { fields: [teamAssignments.userId], references: [user.id] }),
+    user: one(users, { fields: [teamAssignments.userId], references: [users.id] }),
+    organization: one(organizations, { fields: [teamAssignments.organizationId], references: [organizations.id] }),
+    team: one(teams, { fields: [teamAssignments.teamId], references: [teams.id] }),
 }));
 
 export const bookingAnalyticsRelations = relations(bookingAnalytics, ({ one }) => ({
     eventType: one(eventTypes, { fields: [bookingAnalytics.eventTypeId], references: [eventTypes.id] }),
-    user: one(user, { fields: [bookingAnalytics.userId], references: [user.id] }),
+    user: one(users, { fields: [bookingAnalytics.userId], references: [users.id] }),
+    organization: one(organizations, { fields: [bookingAnalytics.organizationId], references: [organizations.id] }),
+    team: one(teams, { fields: [bookingAnalytics.teamId], references: [teams.id] }),
 }));
 
 export const bookingReminderTranslationsRelations = relations(bookingReminderTranslations, ({ one }) => ({
@@ -903,6 +1016,10 @@ export const bookingReminderTranslationsRelations = relations(bookingReminderTra
     language: one(supportedLanguages, {
         fields: [bookingReminderTranslations.languageCode],
         references: [supportedLanguages.code]
+    }),
+    organization: one(organizations, {
+        fields: [bookingReminderTranslations.organizationId],
+        references: [organizations.id]
     }),
 }));
 
@@ -915,6 +1032,10 @@ export const meetingFeedbackTranslationsRelations = relations(meetingFeedbackTra
         fields: [meetingFeedbackTranslations.languageCode],
         references: [supportedLanguages.code]
     }),
+    organization: one(organizations, {
+        fields: [meetingFeedbackTranslations.organizationId],
+        references: [organizations.id]
+    }),
 }));
 
 export const bookingStatusMessagesRelations = relations(bookingStatusMessages, ({ one }) => ({
@@ -922,11 +1043,19 @@ export const bookingStatusMessagesRelations = relations(bookingStatusMessages, (
         fields: [bookingStatusMessages.languageCode],
         references: [supportedLanguages.code]
     }),
+    organization: one(organizations, {
+        fields: [bookingStatusMessages.organizationId],
+        references: [organizations.id]
+    }),
 }));
 
 export const timezoneTranslationsRelations = relations(timezoneTranslations, ({ one }) => ({
     language: one(supportedLanguages, {
         fields: [timezoneTranslations.languageCode],
         references: [supportedLanguages.code]
+    }),
+    organization: one(organizations, {
+        fields: [timezoneTranslations.organizationId],
+        references: [organizations.id]
     }),
 }));

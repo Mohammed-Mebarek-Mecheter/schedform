@@ -12,11 +12,10 @@ import {
     uniqueIndex,
 } from "drizzle-orm/pg-core";
 import { relations } from "drizzle-orm";
-import {user} from "@/db/schema/auth";
-import {forms} from "@/db/schema/forms";
-import {eventTypes} from "@/db/schema/scheduling";
-import {supportedLanguages} from "@/db/schema/localization";
-
+import { users } from "@/db/schema/auth"; // Updated import
+import { forms } from "@/db/schema/forms";
+import { eventTypes } from "@/db/schema/scheduling";
+import { supportedLanguages } from "@/db/schema/localization";
 
 /* ---------------- Enums ---------------- */
 export const triggerTypeEnum = pgEnum("trigger_type", [
@@ -30,8 +29,7 @@ export const triggerTypeEnum = pgEnum("trigger_type", [
     "no_show_detected",
     "scheduled_time",
 ]);
-
-export const actionTypeEnum = pgEnum("action_type", [
+pgEnum("action_type", [
     "send_email",
     "send_sms",
     "webhook_call",
@@ -89,9 +87,9 @@ export const workflows = pgTable(
             .primaryKey()
             .$defaultFn(() => crypto.randomUUID()),
 
-        userId: varchar("user_id", { length: 36 })
+        userId: text("user_id") // Changed to text to match new auth schema
             .notNull()
-            .references(() => user.id, { onDelete: "cascade" }),
+            .references(() => users.id, { onDelete: "cascade" }),
         formId: varchar("form_id", { length: 36 }).references(() => forms.id, {
             onDelete: "cascade",
         }),
@@ -173,9 +171,9 @@ export const integrations = pgTable(
             .primaryKey()
             .$defaultFn(() => crypto.randomUUID()),
 
-        userId: varchar("user_id", { length: 36 })
+        userId: text("user_id") // Changed to text to match new auth schema
             .notNull()
-            .references(() => user.id, { onDelete: "cascade" }),
+            .references(() => users.id, { onDelete: "cascade" }),
 
         type: integrationTypeEnum("type").notNull(),
         name: varchar("name", { length: 255 }).notNull(),
@@ -214,9 +212,9 @@ export const webhooks = pgTable(
             .primaryKey()
             .$defaultFn(() => crypto.randomUUID()),
 
-        userId: varchar("user_id", { length: 36 })
+        userId: text("user_id") // Changed to text to match new auth schema
             .notNull()
-            .references(() => user.id, { onDelete: "cascade" }),
+            .references(() => users.id, { onDelete: "cascade" }),
         formId: varchar("form_id", { length: 36 }).references(() => forms.id, {
             onDelete: "cascade",
         }),
@@ -298,9 +296,9 @@ export const emailTemplates = pgTable(
             .primaryKey()
             .$defaultFn(() => crypto.randomUUID()),
 
-        userId: varchar("user_id", { length: 36 })
+        userId: text("user_id") // Changed to text to match new auth schema
             .notNull()
-            .references(() => user.id, { onDelete: "cascade" }),
+            .references(() => users.id, { onDelete: "cascade" }),
 
         name: varchar("name", { length: 255 }).notNull(),
         description: text("description"),
@@ -342,9 +340,9 @@ export const smsTemplates = pgTable(
             .primaryKey()
             .$defaultFn(() => crypto.randomUUID()),
 
-        userId: varchar("user_id", { length: 36 })
+        userId: text("user_id") // Changed to text to match new auth schema
             .notNull()
-            .references(() => user.id, { onDelete: "cascade" }),
+            .references(() => users.id, { onDelete: "cascade" }),
 
         name: varchar("name", { length: 255 }).notNull(),
         description: text("description"),
@@ -383,9 +381,9 @@ export const notificationQueue = pgTable(
             .primaryKey()
             .$defaultFn(() => crypto.randomUUID()),
 
-        userId: varchar("user_id", { length: 36 })
+        userId: text("user_id") // Changed to text to match new auth schema
             .notNull()
-            .references(() => user.id, { onDelete: "cascade" }),
+            .references(() => users.id, { onDelete: "cascade" }),
 
         type: varchar("type", { length: 50 }).notNull(), // email, sms, slack
         recipient: varchar("recipient", { length: 255 }).notNull(),
@@ -424,9 +422,9 @@ export const aiInsights = pgTable(
             .primaryKey()
             .$defaultFn(() => crypto.randomUUID()),
 
-        userId: varchar("user_id", { length: 36 })
+        userId: text("user_id") // Changed to text to match new auth schema
             .notNull()
-            .references(() => user.id, { onDelete: "cascade" }),
+            .references(() => users.id, { onDelete: "cascade" }),
 
         relatedType: varchar("related_type", { length: 50 }).notNull(),
         relatedId: varchar("related_id", { length: 36 }).notNull(),
@@ -457,9 +455,9 @@ export const automationRules = pgTable(
             .primaryKey()
             .$defaultFn(() => crypto.randomUUID()),
 
-        userId: varchar("user_id", { length: 36 })
+        userId: text("user_id") // Changed to text to match new auth schema
             .notNull()
-            .references(() => user.id, { onDelete: "cascade" }),
+            .references(() => users.id, { onDelete: "cascade" }),
         formId: varchar("form_id", { length: 36 }).references(() => forms.id, {
             onDelete: "cascade",
         }),
@@ -510,8 +508,8 @@ export const emailTemplateTranslations = pgTable(
         localizedVariables: jsonb("localized_variables"), // Variable names and descriptions in this language
 
         status: text("status").notNull().default("draft"), // draft, published, archived
-        translatedBy: varchar("translated_by", { length: 36 }).references(() => user.id, { onDelete: "set null" }),
-        reviewedBy: varchar("reviewed_by", { length: 36 }).references(() => user.id, { onDelete: "set null" }),
+        translatedBy: text("translated_by").references(() => users.id, { onDelete: "set null" }), // Changed to text
+        reviewedBy: text("reviewed_by").references(() => users.id, { onDelete: "set null" }), // Changed to text
 
         createdAt: timestamp("created_at").notNull().defaultNow(),
         updatedAt: timestamp("updated_at").notNull().defaultNow(),
@@ -535,8 +533,8 @@ export const smsTemplateTranslations = pgTable(
         localizedVariables: jsonb("localized_variables"),
 
         status: text("status").notNull().default("draft"),
-        translatedBy: varchar("translated_by", { length: 36 }).references(() => user.id, { onDelete: "set null" }),
-        reviewedBy: varchar("reviewed_by", { length: 36 }).references(() => user.id, { onDelete: "set null" }),
+        translatedBy: text("translated_by").references(() => users.id, { onDelete: "set null" }), // Changed to text
+        reviewedBy: text("reviewed_by").references(() => users.id, { onDelete: "set null" }), // Changed to text
 
         createdAt: timestamp("created_at").notNull().defaultNow(),
         updatedAt: timestamp("updated_at").notNull().defaultNow(),
@@ -597,7 +595,7 @@ export const localizedNotificationQueue = pgTable(
 
 /* ---------------- Relations (Grouped at Bottom) ---------------- */
 export const workflowsRelations = relations(workflows, ({ one, many }) => ({
-    owner: one(user, { fields: [workflows.userId], references: [user.id] }),
+    owner: one(users, { fields: [workflows.userId], references: [users.id] }), // Updated to users
     form: one(forms, { fields: [workflows.formId], references: [forms.id] }),
     eventType: one(eventTypes, {
         fields: [workflows.eventTypeId],
@@ -617,11 +615,11 @@ export const workflowExecutionsRelations = relations(
 );
 
 export const integrationsRelations = relations(integrations, ({ one }) => ({
-    owner: one(user, { fields: [integrations.userId], references: [user.id] }),
+    owner: one(users, { fields: [integrations.userId], references: [users.id] }), // Updated to users
 }));
 
 export const webhooksRelations = relations(webhooks, ({ one, many }) => ({
-    owner: one(user, { fields: [webhooks.userId], references: [user.id] }),
+    owner: one(users, { fields: [webhooks.userId], references: [users.id] }), // Updated to users
     form: one(forms, { fields: [webhooks.formId], references: [forms.id] }),
     eventType: one(eventTypes, {
         fields: [webhooks.eventTypeId],
@@ -641,7 +639,7 @@ export const webhookDeliveriesRelations = relations(
 );
 
 export const emailTemplatesRelations = relations(emailTemplates, ({ one, many }) => ({
-    owner: one(user, { fields: [emailTemplates.userId], references: [user.id] }),
+    owner: one(users, { fields: [emailTemplates.userId], references: [users.id] }), // Updated to users
     translations: many(emailTemplateTranslations),
     defaultLanguageRef: one(supportedLanguages, {
         fields: [emailTemplates.defaultLanguage],
@@ -650,7 +648,7 @@ export const emailTemplatesRelations = relations(emailTemplates, ({ one, many })
 }));
 
 export const smsTemplatesRelations = relations(smsTemplates, ({ one, many }) => ({
-    owner: one(user, { fields: [smsTemplates.userId], references: [user.id] }),
+    owner: one(users, { fields: [smsTemplates.userId], references: [users.id] }), // Updated to users
     translations: many(smsTemplateTranslations),
     defaultLanguageRef: one(supportedLanguages, {
         fields: [smsTemplates.defaultLanguage],
@@ -661,21 +659,21 @@ export const smsTemplatesRelations = relations(smsTemplates, ({ one, many }) => 
 export const notificationQueueRelations = relations(
     notificationQueue,
     ({ one }) => ({
-        owner: one(user, {
+        owner: one(users, { // Updated to users
             fields: [notificationQueue.userId],
-            references: [user.id],
+            references: [users.id],
         }),
     }),
 );
 
 export const aiInsightsRelations = relations(aiInsights, ({ one }) => ({
-    owner: one(user, { fields: [aiInsights.userId], references: [user.id] }),
+    owner: one(users, { fields: [aiInsights.userId], references: [users.id] }), // Updated to users
 }));
 
 export const automationRulesRelations = relations(
     automationRules,
     ({ one }) => ({
-        owner: one(user, { fields: [automationRules.userId], references: [user.id] }),
+        owner: one(users, { fields: [automationRules.userId], references: [users.id] }), // Updated to users
         form: one(forms, { fields: [automationRules.formId], references: [forms.id] }),
         eventType: one(eventTypes, {
             fields: [automationRules.eventTypeId],
@@ -693,13 +691,13 @@ export const emailTemplateTranslationsRelations = relations(emailTemplateTransla
         fields: [emailTemplateTranslations.languageCode],
         references: [supportedLanguages.code]
     }),
-    translator: one(user, {
+    translator: one(users, { // Updated to users
         fields: [emailTemplateTranslations.translatedBy],
-        references: [user.id]
+        references: [users.id]
     }),
-    reviewer: one(user, {
+    reviewer: one(users, { // Updated to users
         fields: [emailTemplateTranslations.reviewedBy],
-        references: [user.id]
+        references: [users.id]
     }),
 }));
 
@@ -712,13 +710,13 @@ export const smsTemplateTranslationsRelations = relations(smsTemplateTranslation
         fields: [smsTemplateTranslations.languageCode],
         references: [supportedLanguages.code]
     }),
-    translator: one(user, {
+    translator: one(users, { // Updated to users
         fields: [smsTemplateTranslations.translatedBy],
-        references: [user.id]
+        references: [users.id]
     }),
-    reviewer: one(user, {
+    reviewer: one(users, { // Updated to users
         fields: [smsTemplateTranslations.reviewedBy],
-        references: [user.id]
+        references: [users.id]
     }),
 }));
 

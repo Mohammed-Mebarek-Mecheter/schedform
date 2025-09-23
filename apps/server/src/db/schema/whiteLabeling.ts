@@ -10,11 +10,9 @@ import {
     index,
     uniqueIndex,
 } from "drizzle-orm/pg-core";
-import {relations, sql} from "drizzle-orm";
-import {user} from "@/db/schema/auth";
-import {teams} from "@/db/schema/business";
-import {supportedLanguages} from "@/db/schema/localization";
-
+import { relations, sql } from "drizzle-orm";
+import { users, organizations, teams } from "@/db/schema/auth"; // Updated import
+import { supportedLanguages } from "@/db/schema/localization";
 
 /**
  * Enums for white-labeling
@@ -34,13 +32,14 @@ export const domainStatusEnum = pgEnum("domain_status", [
 ]);
 
 /**
- * Brand Configurations - Centralized branding settings per user/team
+ * Brand Configurations - Centralized branding settings per user/organization
  */
 export const brandConfigurations = pgTable(
     "brand_configurations",
     {
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        userId: text("user_id").notNull().references(() => user.id, { onDelete: "cascade" }),
+        userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+        organizationId: text("organization_id").references(() => organizations.id, { onDelete: "cascade" }),
         teamId: text("team_id").references(() => teams.id, { onDelete: "cascade" }),
 
         name: text("name").notNull(), // Configuration name (e.g., "Main Brand", "Client Brand")
@@ -103,6 +102,19 @@ export const brandConfigurations = pgTable(
         localizedLogos: jsonb("localized_logos"), // { "en": "url", "es": "url" }
         localizedFavicons: jsonb("localized_favicons"),
 
+        // Plan-based feature flags
+        features: jsonb("features").$type<{
+            twoFactor?: boolean;
+            multiSession?: boolean;
+            phoneOtp?: boolean;
+            bearer?: boolean;
+            jwt?: boolean;
+            apiKey?: boolean;
+            sso?: boolean;
+            customDomain?: boolean;
+            advancedBranding?: boolean;
+        }>().default({}),
+
         // Usage and analytics
         usageCount: integer("usage_count").notNull().default(0),
         lastUsed: timestamp("last_used"),
@@ -112,9 +124,18 @@ export const brandConfigurations = pgTable(
     },
     (t) => ({
         idxUser: index("brand_configurations_user_idx").on(t.userId),
+        idxOrganization: index("brand_configurations_organization_idx").on(t.organizationId),
         idxTeam: index("brand_configurations_team_idx").on(t.teamId),
         uqUserDefault: uniqueIndex("brand_configurations_user_default_uq").on(t.userId, t.isDefault),
+        uqOrganizationDefault: uniqueIndex("brand_configurations_org_default_uq").on(t.organizationId, t.isDefault),
         idxCustomDomain: index("brand_configurations_domain_idx").on(t.customDomain),
+
+        // Ensure only one of userId, organizationId, or teamId is set
+        chkOwnerType: sql`CHECK (
+            (${t.userId} IS NOT NULL AND ${t.organizationId} IS NULL AND ${t.teamId} IS NULL) OR
+            (${t.userId} IS NULL AND ${t.organizationId} IS NOT NULL AND ${t.teamId} IS NULL) OR
+            (${t.userId} IS NULL AND ${t.organizationId} IS NULL AND ${t.teamId} IS NOT NULL)
+        )`,
     })
 );
 
@@ -125,7 +146,8 @@ export const customDomains = pgTable(
     "custom_domains",
     {
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        userId: text("user_id").notNull().references(() => user.id, { onDelete: "cascade" }),
+        userId: text("user_id").references(() => users.id, { onDelete: "cascade" }),
+        organizationId: text("organization_id").references(() => organizations.id, { onDelete: "cascade" }),
         brandConfigId: text("brand_config_id").references(() => brandConfigurations.id, { onDelete: "cascade" }),
 
         domain: text("domain").notNull(), // e.g., "book.clientdomain.com"
@@ -163,7 +185,14 @@ export const customDomains = pgTable(
     (t) => ({
         uqDomain: uniqueIndex("custom_domains_domain_uq").on(t.domain),
         idxUser: index("custom_domains_user_idx").on(t.userId),
+        idxOrganization: index("custom_domains_organization_idx").on(t.organizationId),
         idxStatus: index("custom_domains_status_idx").on(t.status),
+
+        // Ensure proper ownership
+        chkOwnerType: sql`CHECK (
+            (${t.userId} IS NOT NULL AND ${t.organizationId} IS NULL) OR
+            (${t.userId} IS NULL AND ${t.organizationId} IS NOT NULL)
+        )`,
     })
 );
 
@@ -175,7 +204,7 @@ export const brandAssets = pgTable(
     {
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
         brandConfigId: text("brand_config_id").notNull().references(() => brandConfigurations.id, { onDelete: "cascade" }),
-        userId: text("user_id").notNull().references(() => user.id, { onDelete: "cascade" }),
+        userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
 
         assetType: text("asset_type").notNull(), // logo, favicon, background, font, icon
         fileName: text("file_name").notNull(),
@@ -236,7 +265,7 @@ export const whiteLabelTemplates = pgTable(
         ratingCount: integer("rating_count").notNull().default(0),
 
         // Template management
-        createdBy: text("created_by").references(() => user.id, { onDelete: "set null" }),
+        createdBy: text("created_by").references(() => users.id, { onDelete: "set null" }),
         isActive: boolean("is_active").notNull().default(true),
 
         createdAt: timestamp("created_at").notNull().defaultNow(),
@@ -350,7 +379,8 @@ export const whiteLabelTemplateTranslations = pgTable(
    ============================ */
 
 export const brandConfigurationsRelations = relations(brandConfigurations, ({ one, many }) => ({
-    owner: one(user, { fields: [brandConfigurations.userId], references: [user.id] }),
+    owner: one(users, { fields: [brandConfigurations.userId], references: [users.id] }),
+    organization: one(organizations, { fields: [brandConfigurations.organizationId], references: [organizations.id] }),
     team: one(teams, { fields: [brandConfigurations.teamId], references: [teams.id] }),
 
     customDomains: many(customDomains),
@@ -364,17 +394,18 @@ export const brandConfigurationsRelations = relations(brandConfigurations, ({ on
 }));
 
 export const customDomainsRelations = relations(customDomains, ({ one }) => ({
-    owner: one(user, { fields: [customDomains.userId], references: [user.id] }),
+    owner: one(users, { fields: [customDomains.userId], references: [users.id] }),
+    organization: one(organizations, { fields: [customDomains.organizationId], references: [organizations.id] }),
     brandConfig: one(brandConfigurations, { fields: [customDomains.brandConfigId], references: [brandConfigurations.id] }),
 }));
 
 export const brandAssetsRelations = relations(brandAssets, ({ one }) => ({
     brandConfig: one(brandConfigurations, { fields: [brandAssets.brandConfigId], references: [brandConfigurations.id] }),
-    owner: one(user, { fields: [brandAssets.userId], references: [user.id] }),
+    owner: one(users, { fields: [brandAssets.userId], references: [users.id] }),
 }));
 
 export const whiteLabelTemplatesRelations = relations(whiteLabelTemplates, ({ one, many }) => ({
-    creator: one(user, { fields: [whiteLabelTemplates.createdBy], references: [user.id] }),
+    creator: one(users, { fields: [whiteLabelTemplates.createdBy], references: [users.id] }),
     translations: many(whiteLabelTemplateTranslations),
 }));
 

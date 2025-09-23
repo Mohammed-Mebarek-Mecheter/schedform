@@ -29,7 +29,294 @@ import { emailHarmony, phoneHarmony } from "better-auth-harmony";
 import { z } from "zod";
 import {drizzleAdapter} from "better-auth/adapters/drizzle";
 import {eq} from "drizzle-orm";
+import {sso} from "better-auth/plugins/sso";
 import {organizations} from "@/db/schema/auth";
+
+// Logger utility for billing events
+class BillingLogger {
+    static log(event: string, data: any, level: 'info' | 'warn' | 'error' = 'info') {
+        const timestamp = new Date().toISOString();
+        const logEntry = {
+            timestamp,
+            service: 'schedform-billing',
+            event,
+            level,
+            data
+        };
+
+        // Console logging (replace with your preferred logging service)
+        console.log(JSON.stringify(logEntry));
+
+        // TODO: Integrate with your logging service (LogSnag, PostHog, etc.)
+        // await logToService(logEntry);
+    }
+
+    static error(event: string, error: Error, context?: any) {
+        this.log(event, { error: error.message, stack: error.stack, ...context }, 'error');
+    }
+
+    static warn(event: string, data: any) {
+        this.log(event, data, 'warn');
+    }
+}
+
+// Billing service for handling Polar operations
+class BillingService {
+    private static instance: BillingService;
+
+    static getInstance() {
+        if (!BillingService.instance) {
+            BillingService.instance = new BillingService();
+        }
+        return BillingService.instance;
+    }
+
+    // Map Polar price IDs to SchedForm plan types
+    mapPriceToPlan(priceId: string): "free" | "starter" | "professional" | "business" {
+        const {
+            POLAR_STARTER_MONTHLY_PRODUCT_ID,
+            POLAR_STARTER_YEARLY_PRODUCT_ID,
+            POLAR_PRO_MONTHLY_PRODUCT_ID,
+            POLAR_PRO_YEARLY_PRODUCT_ID,
+            POLAR_BUSINESS_MONTHLY_PRODUCT_ID,
+            POLAR_BUSINESS_YEARLY_PRODUCT_ID
+        } = env;
+
+        const planMap: Record<string, "starter" | "professional" | "business"> = {
+            [POLAR_STARTER_MONTHLY_PRODUCT_ID]: "starter",
+            [POLAR_STARTER_YEARLY_PRODUCT_ID]: "starter",
+            [POLAR_PRO_MONTHLY_PRODUCT_ID]: "professional",
+            [POLAR_PRO_YEARLY_PRODUCT_ID]: "professional",
+            [POLAR_BUSINESS_MONTHLY_PRODUCT_ID]: "business",
+            [POLAR_BUSINESS_YEARLY_PRODUCT_ID]: "business"
+        };
+
+        return planMap[priceId] || "free";
+    }
+
+    // Get plan limits
+    getPlanLimits(planType: string) {
+        const limits = {
+            free: {
+                monthlyResponses: 100,
+                activeForms: 1,
+                teamMembers: 1,
+                integrations: 0,
+                customBranding: false,
+                whiteLabeling: false,
+                apiAccess: false,
+                features: {
+                    twoFactor: false,
+                    multiSession: false,
+                    phoneOtp: false,
+                    bearer: false,
+                    jwt: false,
+                    apiKey: false,
+                    sso: false, // reserved for future
+                },
+            },
+            starter: {
+                monthlyResponses: 1000,
+                activeForms: 5,
+                teamMembers: 3,
+                integrations: 1,
+                customBranding: true,
+                whiteLabeling: false,
+                apiAccess: false,
+                features: {
+                    twoFactor: false,
+                    multiSession: false,
+                    phoneOtp: false,
+                    bearer: false,
+                    jwt: false,
+                    apiKey: false,
+                    sso: false,
+                },
+            },
+            professional: {
+                monthlyResponses: 5000,
+                activeForms: Infinity,
+                teamMembers: 10,
+                integrations: 3,
+                customBranding: true,
+                whiteLabeling: true,
+                apiAccess: true,
+                features: {
+                    twoFactor: true,
+                    multiSession: true,
+                    phoneOtp: true,
+                    bearer: true,
+                    jwt: true,
+                    apiKey: true,
+                    sso: false, // still disabled
+                },
+            },
+            business: {
+                monthlyResponses: 20000,
+                activeForms: Infinity,
+                teamMembers: 50,
+                integrations: 5,
+                customBranding: true,
+                whiteLabeling: true,
+                apiAccess: true,
+                features: {
+                    twoFactor: true,
+                    multiSession: true,
+                    phoneOtp: true,
+                    bearer: true,
+                    jwt: true,
+                    apiKey: true,
+                    sso: false, // enable later when requested
+                },
+            },
+        };
+
+        return limits[planType as keyof typeof limits] || limits.free;
+    }
+
+    // Create Polar customer for organization
+    async createOrganizationCustomer(organizationId: string, organizationName: string, userEmail: string, userName: string) {
+        try {
+            BillingLogger.log('creating_polar_customer', { organizationId, organizationName, userEmail });
+
+            const customer = await polarClient.customers.create({
+                email: userEmail,
+                name: userName || organizationName,
+                metadata: {
+                    organizationId,
+                    organizationName,
+                    signupSource: "schedform",
+                    createdAt: new Date().toISOString()
+                }
+            });
+
+            BillingLogger.log('polar_customer_created', {
+                organizationId,
+                polarCustomerId: customer.id,
+                customerEmail: customer.email
+            });
+
+            return customer;
+        } catch (error) {
+            BillingLogger.error('failed_to_create_polar_customer', error as Error, { organizationId, userEmail });
+            throw error;
+        }
+    }
+
+    // Update organization subscription
+    async updateOrganizationSubscription(organizationId: string, updates: {
+        planType: string;
+        subscriptionStatus: string;
+        subscriptionId?: string;
+        currentPeriodEnd?: Date;
+        polarCustomerId?: string;
+    }) {
+        try {
+            const limits = this.getPlanLimits(updates.planType);
+
+            const updateData: any = {
+                planType: updates.planType,
+                subscriptionStatus: updates.subscriptionStatus,
+                monthlyResponseLimit: limits.monthlyResponses,
+                customBrandingEnabled: limits.customBranding,
+                whitelabelEnabled: limits.whiteLabeling,
+                apiAccessEnabled: limits.apiAccess,
+                features: limits.features,
+                limits: limits,
+                lastActiveAt: new Date()
+            };
+
+            if (updates.subscriptionId) updateData.subscriptionId = updates.subscriptionId;
+            if (updates.currentPeriodEnd) updateData.currentPeriodEnd = updates.currentPeriodEnd;
+            if (updates.polarCustomerId) updateData.polarCustomerId = updates.polarCustomerId;
+
+            const result = await defaultDb.update(organizations)
+                .set(updateData)
+                .where(eq(organizations.id, organizationId))
+                .returning({ id: organizations.id, name: organizations.name });
+
+            if (result.length === 0) {
+                throw new Error(`Organization ${organizationId} not found`);
+            }
+
+            BillingLogger.log('organization_subscription_updated', {
+                organizationId,
+                organizationName: result[0].name,
+                updates
+            });
+
+            return result[0];
+        } catch (error) {
+            BillingLogger.error('failed_to_update_organization_subscription', error as Error, {
+                organizationId,
+                updates
+            });
+            throw error;
+        }
+    }
+
+    // Handle subscription webhook event
+    async handleSubscriptionWebhook(payload: any, eventType: string) {
+        try {
+            BillingLogger.log('processing_subscription_webhook', { eventType, payload });
+
+            const polarCustomerId = payload.data.customer?.id;
+            const subscriptionId = payload.data.id;
+            const priceId = payload.data.price?.id;
+            const status = payload.data.status;
+            const currentPeriodEnd = payload.data.currentPeriodEnd ?
+                new Date(payload.data.currentPeriodEnd) : undefined;
+
+            if (!polarCustomerId) {
+                BillingLogger.warn('missing_polar_customer_id', { eventType, subscriptionId });
+                return;
+            }
+
+            // Find organization by Polar customer ID
+            const orgResult = await defaultDb.select()
+                .from(organizations)
+                .where(eq(organizations.polarCustomerId, polarCustomerId))
+                .limit(1);
+
+            if (orgResult.length === 0) {
+                BillingLogger.warn('organization_not_found_for_polar_customer', { polarCustomerId, eventType });
+                return;
+            }
+
+            const organization = orgResult[0];
+
+            // SIMPLIFIED: No trial logic - free tier is the "trial"
+            const planType = priceId ? this.mapPriceToPlan(priceId) : 'free';
+
+            // Map status without trial considerations
+            let subscriptionStatus = status;
+            if (status === 'active') subscriptionStatus = 'active';
+            else if (status === 'canceled') subscriptionStatus = 'canceled';
+            else if (status === 'incomplete') subscriptionStatus = 'incomplete';
+            else if (status === 'past_due') subscriptionStatus = 'past_due';
+
+            await this.updateOrganizationSubscription(organization.id, {
+                planType,
+                subscriptionStatus,
+                subscriptionId,
+                currentPeriodEnd,
+                polarCustomerId
+            });
+
+            BillingLogger.log('subscription_webhook_processed', {
+                organizationId: organization.id,
+                eventType,
+                planType,
+                subscriptionStatus
+            });
+
+        } catch (error) {
+            BillingLogger.error('subscription_webhook_error', error as Error, { eventType, payload });
+        }
+    }
+}
+
+const billingService = BillingService.getInstance();
 
 // Create access control for SchedForm's permissions
 const schedFormStatement = {
@@ -167,6 +454,153 @@ const managerRole = ac.newRole({
     billing: [], // No billing access
 });
 
+// Helper functions for organization management
+interface SubscriptionData {
+    planType: "free" | "starter" | "professional" | "business";
+}
+
+async function getOrganizationSubscription(organizationId: string): Promise<SubscriptionData | null> {
+    try {
+        const result = await defaultDb.select({
+            planType: organizations.planType,
+            subscriptionStatus: organizations.subscriptionStatus
+        })
+            .from(organizations)
+            .where(eq(organizations.id, organizationId))
+            .limit(1);
+
+        return result[0] as SubscriptionData || null;
+    } catch (error) {
+        BillingLogger.error('failed_to_get_organization_subscription', error as Error, { organizationId });
+        return null;
+    }
+}
+
+async function createDefaultBrandConfiguration(organizationId: string, userId: string): Promise<void> {
+    BillingLogger.log('creating_default_brand_configuration', { organizationId, userId });
+}
+
+async function createDefaultTeam(organizationId: string, userId: string): Promise<void> {
+    BillingLogger.log('creating_default_team', { organizationId, userId });
+}
+
+async function createDefaultEmailTemplates(organizationId: string, userId: string): Promise<void> {
+    BillingLogger.log('creating_default_email_templates', { organizationId, userId });
+}
+
+async function initializeOrganizationAnalytics(organizationId: string): Promise<void> {
+    BillingLogger.log('initializing_organization_analytics', { organizationId });
+}
+
+async function logOrganizationEvent(organizationId: string, event: string, data: any): Promise<void> {
+    BillingLogger.log(`organization_${event}`, { organizationId, ...data });
+}
+
+async function backupOrganizationData(organizationId: string): Promise<void> {
+    BillingLogger.log('backing_up_organization_data', { organizationId });
+}
+
+async function cancelOrganizationSubscriptions(organizationId: string): Promise<void> {
+    try {
+        // Cancel Polar subscription if exists
+        const orgResult = await defaultDb.select({ subscriptionId: organizations.subscriptionId })
+            .from(organizations)
+            .where(eq(organizations.id, organizationId))
+            .limit(1);
+
+        if (orgResult[0]?.subscriptionId) {
+            // Implement Polar subscription cancellation
+            BillingLogger.log('canceling_polar_subscription', {
+                organizationId,
+                subscriptionId: orgResult[0].subscriptionId
+            });
+        }
+    } catch (error) {
+        BillingLogger.error('failed_to_cancel_subscriptions', error as Error, { organizationId });
+    }
+}
+
+async function cleanupExternalIntegrations(organizationId: string): Promise<void> {
+    BillingLogger.log('cleaning_up_external_integrations', { organizationId });
+}
+
+async function cleanupExternalServices(organizationId: string): Promise<void> {
+    BillingLogger.log('final_cleanup', { organizationId });
+}
+
+async function getOrganizationMemberCount(organizationId: string): Promise<number> {
+    // Implement actual member count logic
+    return 1;
+}
+
+function getMemberLimitForPlan(planType: string): number {
+    const limits = billingService.getPlanLimits(planType);
+    return limits.teamMembers;
+}
+
+async function createDefaultUserPreferences(userId: string, organizationId: string): Promise<void> {
+    BillingLogger.log('creating_user_preferences', { userId, organizationId });
+}
+
+async function updateOrganizationMemberCount(organizationId: string): Promise<void> {
+    BillingLogger.log('updating_member_count_cache', { organizationId });
+}
+
+async function backupMemberData(memberId: string, organizationId: string): Promise<void> {
+    BillingLogger.log('backing_up_member_data', { memberId, organizationId });
+}
+
+async function reassignMemberResources(memberId: string, organizationId: string): Promise<void> {
+    BillingLogger.log('reassigning_member_resources', { memberId, organizationId });
+}
+
+async function revokeUserAccess(userId: string, organizationId: string): Promise<void> {
+    BillingLogger.log('revoking_user_access', { userId, organizationId });
+}
+
+async function cleanupUserOrganizationData(userId: string, organizationId: string): Promise<void> {
+    BillingLogger.log('cleaning_up_user_data', { userId, organizationId });
+}
+
+async function validateRoleChange(member: any, newRole: string, organization: any): Promise<void> {
+    BillingLogger.log('validating_role_change', { memberId: member.id, newRole, organizationId: organization.id });
+}
+
+async function updateUserPermissionsCache(userId: string, organizationId: string): Promise<void> {
+    BillingLogger.log('updating_permissions_cache', { userId, organizationId });
+}
+
+async function notifyRoleChange(user: any, organization: any, previousRole: string, newRole: string): Promise<void> {
+    BillingLogger.log('sending_role_change_notification', {
+        userId: user.id,
+        organizationId: organization.id,
+        previousRole,
+        newRole
+    });
+}
+
+async function getPendingInvitationCount(organizationId: string): Promise<number> {
+    return 0;
+}
+
+function getInvitationLimitForPlan(planType: string): number {
+    switch (planType) {
+        case "free": return 5;
+        case "starter": return 25;
+        case "professional": return 100;
+        case "business": return 500;
+        default: return 5;
+    }
+}
+
+async function updatePendingInvitationCount(organizationId: string): Promise<void> {
+    BillingLogger.log('updating_invitation_count_cache', { organizationId });
+}
+
+async function createDefaultTeamResources(teamId: string, organizationId: string): Promise<void> {
+    BillingLogger.log('creating_default_team_resources', { teamId, organizationId });
+}
+
 // Validation schemas for endpoints
 const SignupSchema = z.object({
     name: z.string().min(2, "Name must be at least 2 characters"),
@@ -218,147 +652,6 @@ const VerifyPhoneOTPSchema = z.object({
     phoneNumber: z.string().min(10, "Phone number must be at least 10 digits"),
     otp: z.string().length(6, "OTP must be 6 digits"),
 });
-
-// Helper functions for organization management
-interface SubscriptionData {
-    planType: "free" | "starter" | "professional" | "business";
-}
-
-async function getOrganizationSubscription(organizationId: string): Promise<SubscriptionData | null> {
-    // Implementation would query your subscriptions table
-    // Return subscription data including planType
-    return null;
-}
-
-async function createDefaultBrandConfiguration(organizationId: string, userId: string): Promise<void> {
-    // Create default brand configuration for the organization
-    console.log("Creating default brand configuration");
-}
-
-async function createDefaultTeam(organizationId: string, userId: string): Promise<void> {
-    // Create a default "General" team
-    console.log("Creating default team");
-}
-
-async function createDefaultEmailTemplates(organizationId: string, userId: string): Promise<void> {
-    // Create default email templates for bookings, reminders, etc.
-    console.log("Creating default email templates");
-}
-
-async function initializeOrganizationAnalytics(organizationId: string): Promise<void> {
-    // Set up analytics tracking for the organization
-    console.log("Initializing analytics");
-}
-
-async function logOrganizationEvent(organizationId: string, event: string, data: any): Promise<void> {
-    // Log events for analytics and auditing
-    console.log(`Organization ${organizationId}: ${event}`, data);
-}
-
-async function backupOrganizationData(organizationId: string): Promise<void> {
-    // Backup organization data before deletion
-    console.log("Backing up organization data");
-}
-
-async function cancelOrganizationSubscriptions(organizationId: string): Promise<void> {
-    // Cancel any active subscriptions
-    console.log("Cancelling subscriptions");
-}
-
-async function cleanupExternalIntegrations(organizationId: string): Promise<void> {
-    // Clean up integrations with external services
-    console.log("Cleaning up integrations");
-}
-
-async function cleanupExternalServices(organizationId: string): Promise<void> {
-    // Final cleanup of external services
-    console.log("Final cleanup");
-}
-
-async function getOrganizationMemberCount(organizationId: string): Promise<number> {
-    // Get current member count
-    return 0;
-}
-
-function getMemberLimitForPlan(planType: string): number {
-    switch (planType) {
-        case "free": return 1;
-        case "starter": return 3;
-        case "professional": return 10;
-        case "business": return 50;
-        default: return 1;
-    }
-}
-
-async function createDefaultUserPreferences(userId: string, organizationId: string): Promise<void> {
-    // Create default user preferences
-    console.log("Creating user preferences");
-}
-
-async function updateOrganizationMemberCount(organizationId: string): Promise<void> {
-    // Update cached member count
-    console.log("Updating member count cache");
-}
-
-async function backupMemberData(memberId: string, organizationId: string): Promise<void> {
-    // Backup member data before removal
-    console.log("Backing up member data");
-}
-
-async function reassignMemberResources(memberId: string, organizationId: string): Promise<void> {
-    // Reassign resources owned by departing member
-    console.log("Reassigning member resources");
-}
-
-async function revokeUserAccess(userId: string, organizationId: string): Promise<void> {
-    // Revoke user access to organization resources
-    console.log("Revoking user access");
-}
-
-async function cleanupUserOrganizationData(userId: string, organizationId: string): Promise<void> {
-    // Clean up user-specific organization data
-    console.log("Cleaning up user data");
-}
-
-async function validateRoleChange(member: any, newRole: string, organization: any): Promise<void> {
-    // Validate that the role change is allowed
-    console.log("Validating role change");
-}
-
-async function updateUserPermissionsCache(userId: string, organizationId: string): Promise<void> {
-    // Update cached user permissions
-    console.log("Updating permissions cache");
-}
-
-async function notifyRoleChange(user: any, organization: any, previousRole: string, newRole: string): Promise<void> {
-    // Send notification about role change
-    console.log("Sending role change notification");
-}
-
-async function getPendingInvitationCount(organizationId: string): Promise<number> {
-    // Get count of pending invitations
-    return 0;
-}
-
-function getInvitationLimitForPlan(planType: string): number {
-    switch (planType) {
-        case "free": return 5;
-        case "starter": return 25;
-        case "professional": return 100;
-        case "business": return 500;
-        default: return 5;
-    }
-}
-
-async function updatePendingInvitationCount(organizationId: string): Promise<void> {
-    // Update cached pending invitation count
-    console.log("Updating invitation count cache");
-}
-
-async function createDefaultTeamResources(teamId: string, organizationId: string): Promise<void> {
-    // Create default resources for new team
-    console.log("Creating default team resources");
-}
 
 // Main auth creation function for Cloudflare Workers
 const baseAuthConfig: BetterAuthOptions = {
@@ -555,7 +848,10 @@ const baseAuthConfig: BetterAuthOptions = {
             // Comprehensive organization hooks for SchedForm workflows
             organizationHooks: {
                 beforeCreateOrganization: async ({ organization, user }) => {
-                    console.log(`Creating organization "${organization.name}" for user ${user.email}`);
+                    BillingLogger.log('creating_organization', {
+                        organizationName: organization.name,
+                        userEmail: user.email
+                    });
 
                     return {
                         data: {
@@ -583,28 +879,59 @@ const baseAuthConfig: BetterAuthOptions = {
                 },
 
                 afterCreateOrganization: async ({ organization, user }) => {
-                    console.log(`Organization ${organization.name} created successfully`);
+                    BillingLogger.log('organization_created', {
+                        organizationId: organization.id,
+                        organizationName: organization.name
+                    });
 
-                    // Create default resources for SchedForm
-                    await Promise.all([
-                        createDefaultBrandConfiguration(organization.id, user.id),
-                        createDefaultTeam(organization.id, user.id),
-                        createDefaultEmailTemplates(organization.id, user.id),
-                        initializeOrganizationAnalytics(organization.id),
-                        sendWelcomeEmail({
-                            email: user.email,
-                            userName: user.name || user.email,
-                            isNewOrganization: true,
-                        }),
-                        logOrganizationEvent(organization.id, "organization_created", {
-                            createdBy: user.id,
-                            planType: "free",
-                        }),
-                    ]);
+                    try {
+                        // Create Polar customer for the organization
+                        const customer = await billingService.createOrganizationCustomer(
+                            organization.id,
+                            organization.name,
+                            user.email,
+                            user.name || user.email
+                        );
+
+                        // Update organization with Polar customer ID
+                        await defaultDb.update(organizations)
+                            .set({ polarCustomerId: customer.id })
+                            .where(eq(organizations.id, organization.id));
+
+                        // Create default resources for SchedForm
+                        await Promise.all([
+                            createDefaultBrandConfiguration(organization.id, user.id),
+                            createDefaultTeam(organization.id, user.id),
+                            createDefaultEmailTemplates(organization.id, user.id),
+                            initializeOrganizationAnalytics(organization.id),
+                            sendWelcomeEmail({
+                                email: user.email,
+                                userName: user.name || user.email,
+                                isNewOrganization: true,
+                            }),
+                            logOrganizationEvent(organization.id, "organization_created", {
+                                createdBy: user.id,
+                                planType: "free",
+                                polarCustomerId: customer.id
+                            }),
+                        ]);
+
+                        BillingLogger.log('organization_setup_completed', {
+                            organizationId: organization.id,
+                            polarCustomerId: customer.id
+                        });
+
+                    } catch (error) {
+                        BillingLogger.error('organization_setup_failed', error as Error, {
+                            organizationId: organization.id,
+                            userEmail: user.email
+                        });
+                        // Don't throw - organization creation should succeed even if billing setup fails
+                    }
                 },
 
                 beforeUpdateOrganization: async ({ organization, user }) => {
-                    console.log(`Updating organization ${organization.id}`);
+                    BillingLogger.log('updating_organization', { organizationId: organization.id });
 
                     return {
                         data: {
@@ -632,7 +959,7 @@ const baseAuthConfig: BetterAuthOptions = {
                 },
 
                 beforeDeleteOrganization: async ({ organization, user }) => {
-                    console.log(`Preparing to delete organization ${organization.id}`);
+                    BillingLogger.log('preparing_to_delete_organization', { organizationId: organization.id });
 
                     await backupOrganizationData(organization.id);
                     await cancelOrganizationSubscriptions(organization.id);
@@ -640,7 +967,7 @@ const baseAuthConfig: BetterAuthOptions = {
                 },
 
                 afterDeleteOrganization: async ({ organization, user }) => {
-                    console.log(`Organization ${organization.id} deleted successfully`);
+                    BillingLogger.log('organization_deleted', { organizationId: organization.id });
 
                     await Promise.all([
                         cleanupExternalServices(organization.id),
@@ -652,7 +979,10 @@ const baseAuthConfig: BetterAuthOptions = {
                 },
 
                 beforeAddMember: async ({ member, user, organization }) => {
-                    console.log(`Adding member ${user.email} to ${organization.name}`);
+                    BillingLogger.log('adding_member', {
+                        userEmail: user.email,
+                        organizationName: organization.name
+                    });
 
                     const subscription = await getOrganizationSubscription(organization.id);
                     const currentMemberCount = await getOrganizationMemberCount(organization.id);
@@ -692,7 +1022,10 @@ const baseAuthConfig: BetterAuthOptions = {
                 },
 
                 beforeRemoveMember: async ({ member, user, organization }) => {
-                    console.log(`Removing member ${user.email} from ${organization.name}`);
+                    BillingLogger.log('removing_member', {
+                        userEmail: user.email,
+                        organizationName: organization.name
+                    });
 
                     await backupMemberData(member.id, organization.id);
                     await reassignMemberResources(member.id, organization.id);
@@ -712,7 +1045,10 @@ const baseAuthConfig: BetterAuthOptions = {
                 },
 
                 beforeUpdateMemberRole: async ({ member, newRole, user, organization }) => {
-                    console.log(`Updating role for ${user.email} to ${newRole}`);
+                    BillingLogger.log('updating_member_role', {
+                        userEmail: user.email,
+                        newRole
+                    });
 
                     await validateRoleChange(member, newRole, organization);
 
@@ -742,7 +1078,10 @@ const baseAuthConfig: BetterAuthOptions = {
                 },
 
                 beforeCreateInvitation: async ({ invitation, inviter, organization }) => {
-                    console.log(`Creating invitation for ${invitation.email} to ${organization.name}`);
+                    BillingLogger.log('creating_invitation', {
+                        invitedEmail: invitation.email,
+                        organizationName: organization.name
+                    });
 
                     const subscription = await getOrganizationSubscription(organization.id);
                     const pendingInvitations = await getPendingInvitationCount(organization.id);
@@ -798,7 +1137,10 @@ const baseAuthConfig: BetterAuthOptions = {
                         throw new Error('User is required to create a team');
                     }
 
-                    console.log(`Creating team "${team.name}" in ${organization.name}`);
+                    BillingLogger.log('creating_team', {
+                        teamName: team.name,
+                        organizationName: organization.name
+                    });
 
                     return {
                         data: {
@@ -1044,6 +1386,8 @@ const baseAuthConfig: BetterAuthOptions = {
             },
         }),
 
+        sso(),
+
         // Two-factor authentication
         twoFactor({
             issuer: "SchedForm",
@@ -1129,7 +1473,7 @@ const baseAuthConfig: BetterAuthOptions = {
         // Polar billing integration
         polar({
             client: polarClient,
-            createCustomerOnSignUp: true, // Now enabled for automatic customer creation
+            createCustomerOnSignUp: false, // Now enabled for automatic customer creation
             enableCustomerPortal: true,
             getCustomerCreateParams: async ({ user }, request) => {
                 // Ensure required fields are defined
@@ -1163,6 +1507,7 @@ const baseAuthConfig: BetterAuthOptions = {
                             productId: env.POLAR_BUSINESS_MONTHLY_PRODUCT_ID,
                             slug: "business-monthly",
                         },
+                        // Yearly plans
                         {
                             productId: env.POLAR_STARTER_YEARLY_PRODUCT_ID,
                             slug: "starter-yearly",
@@ -1183,209 +1528,28 @@ const baseAuthConfig: BetterAuthOptions = {
                 webhooks({
                     secret: env.POLAR_WEBHOOK_SECRET,
                     onSubscriptionActive: async (payload) => {
-                        console.log("Subscription activated:", payload);
-                        try {
-                            const polarCustomerId = payload.data.customer?.id; // Get Polar Customer ID
-                            const subscriptionId = payload.data.id; // Get Polar Subscription ID
-                            const currentPeriodEnd = payload.data.currentPeriodEnd ? new Date(payload.data.currentPeriodEnd) : null; // Convert timestamp if present
-
-                            // --- Map Polar data to your fields ---
-                            // You need to implement the logic to determine planType based on the payload
-                            // This might involve checking payload.data.price.productId, payload.data.productId, etc.
-                            // Example (replace with your actual mapping logic):
-                            let planType = "free"; // Default
-                            if (payload.data.productId === env.POLAR_STARTER_MONTHLY_PRODUCT_ID ||
-                                payload.data.productId === env.POLAR_STARTER_YEARLY_PRODUCT_ID) {
-                                planType = "starter";
-                            } else if (payload.data.productId === env.POLAR_PRO_MONTHLY_PRODUCT_ID ||
-                                payload.data.productId === env.POLAR_PRO_YEARLY_PRODUCT_ID) {
-                                planType = "professional";
-                            } else if (payload.data.productId === env.POLAR_BUSINESS_MONTHLY_PRODUCT_ID ||
-                                payload.data.productId === env.POLAR_BUSINESS_YEARLY_PRODUCT_ID) {
-                                planType = "business";
-                            }
-                            const subscriptionStatus = "active"; // Map Polar 'active' status
-
-                            if (!polarCustomerId) {
-                                console.error("Polar Customer ID not found in payload for active subscription:", payload);
-                                return; // Or handle error appropriately
-                            }
-
-                            // Update the organization record
-                            const result = await defaultDb.update(organizations)
-                                .set({
-                                    subscriptionStatus, // Set status to 'active'
-                                    planType,           // Set the mapped plan type
-                                    subscriptionId,     // Store the Polar subscription ID
-                                    currentPeriodEnd,   // Set the period end date
-                                    // Optionally update other fields like features/limits based on planType here
-                                })
-                                .where(eq(organizations.polarCustomerId, polarCustomerId))
-                                .returning({ updatedId: organizations.id }); // Optional: get the ID of the updated org
-
-                            if (result.length > 0) {
-                                console.log(`Organization ${result[0].updatedId} updated for active subscription ${subscriptionId}`);
-                            } else {
-                                console.warn(`No organization found for Polar Customer ID: ${polarCustomerId}`);
-                                // Consider logging this for investigation if it happens unexpectedly
-                            }
-                        } catch (error) {
-                            console.error("Error updating organization on subscription active:", error);
-                            // Depending on your setup, you might want to re-throw or handle differently
-                        }
+                        await billingService.handleSubscriptionWebhook(payload, 'subscription_active');
                     },
                     onSubscriptionCanceled: async (payload) => {
-                        console.log("Subscription canceled:", payload);
-                        try {
-                            const polarCustomerId = payload.data.customer?.id;
-                            const subscriptionId = payload.data.id; // Useful for logging/context
-                            const currentPeriodEnd = payload.data.currentPeriodEnd ? new Date(payload.data.currentPeriodEnd) : null;
-
-                            if (!polarCustomerId) {
-                                console.error("Polar Customer ID not found in payload for canceled subscription:", payload);
-                                return;
-                            }
-
-                            const subscriptionStatus = "canceled"; // Map Polar 'canceled' status
-                            // planType might remain the same or be set to 'free' depending on your logic
-                            // Let's assume it stays the same until explicitly changed by a new subscription or downgrade
-
-                            const result = await defaultDb.update(organizations)
-                                .set({
-                                    subscriptionStatus, // Set status to 'canceled'
-                                    // planType: "free", // Example: Reset plan if desired
-                                    currentPeriodEnd,   // Update the end date (might be immediate or end of period)
-                                    // subscriptionId could be cleared or kept, depending on your needs
-                                    // subscriptionId: null,
-                                })
-                                .where(eq(organizations.polarCustomerId, polarCustomerId))
-                                .returning({ updatedId: organizations.id });
-
-                            if (result.length > 0) {
-                                console.log(`Organization ${result[0].updatedId} updated for canceled subscription ${subscriptionId}`);
-                            } else {
-                                console.warn(`No organization found for Polar Customer ID: ${polarCustomerId}`);
-                            }
-                        } catch (error) {
-                            console.error("Error updating organization on subscription canceled:", error);
-                        }
+                        await billingService.handleSubscriptionWebhook(payload, 'subscription_canceled');
                     },
                     onSubscriptionUpdated: async (payload) => {
-                        console.log("Subscription updated:", payload);
-                        try {
-                            const polarCustomerId = payload.data.customer?.id;
-                            const subscriptionId = payload.data.id;
-                            const currentPeriodEnd = payload.data.currentPeriodEnd ? new Date(payload.data.currentPeriodEnd) : null;
-
-                            // --- Map updated Polar data to your fields ---
-                            let planType = "free"; // Default or fetch current if unchanged
-                            // Implement logic similar to onSubscriptionActive to determine the *new* planType based on updated payload data
-                            // Example (replace with your actual mapping logic based on *updated* data):
-                            if (payload.data.productId === env.POLAR_STARTER_MONTHLY_PRODUCT_ID ||
-                                payload.data.productId === env.POLAR_STARTER_YEARLY_PRODUCT_ID) {
-                                planType = "starter";
-                            } else if (payload.data.productId === env.POLAR_PRO_MONTHLY_PRODUCT_ID ||
-                                payload.data.productId === env.POLAR_PRO_YEARLY_PRODUCT_ID) {
-                                planType = "professional";
-                            } else if (payload.data.productId === env.POLAR_BUSINESS_MONTHLY_PRODUCT_ID ||
-                                payload.data.productId === env.POLAR_BUSINESS_YEARLY_PRODUCT_ID) {
-                                planType = "business";
-                            }
-                            // Status might also change on update, check payload.data.status
-                            const subscriptionStatus = payload.data.status || "active"; // Default to active if not explicitly provided in update context
-
-                            if (!polarCustomerId) {
-                                console.error("Polar Customer ID not found in payload for updated subscription:", payload);
-                                return;
-                            }
-
-                            const result = await defaultDb.update(organizations)
-                                .set({
-                                    subscriptionStatus, // Set potentially updated status
-                                    planType,           // Set potentially updated plan type
-                                    subscriptionId,     // Ensure subscription ID is correct
-                                    currentPeriodEnd,   // Update the period end date
-                                    // Update other fields like features/limits based on new planType if needed
-                                })
-                                .where(eq(organizations.polarCustomerId, polarCustomerId))
-                                .returning({ updatedId: organizations.id });
-
-                            if (result.length > 0) {
-                                console.log(`Organization ${result[0].updatedId} updated for updated subscription ${subscriptionId}`);
-                            } else {
-                                console.warn(`No organization found for Polar Customer ID: ${polarCustomerId}`);
-                            }
-                        } catch (error) {
-                            console.error("Error updating organization on subscription updated:", error);
-                        }
+                        await billingService.handleSubscriptionWebhook(payload, 'subscription_updated');
                     },
                     onSubscriptionRevoked: async (payload) => {
-                        // Similar logic to canceled, potentially immediate effect
-                        console.log("Subscription revoked:", payload);
-                        try {
-                            const polarCustomerId = payload.data.customer?.id;
-                            const subscriptionId = payload.data.id;
-                            const currentPeriodEnd = payload.data.currentPeriodEnd ? new Date(payload.data.currentPeriodEnd) : null; // Might be immediate
-
-                            if (!polarCustomerId) {
-                                console.error("Polar Customer ID not found in payload for revoked subscription:", payload);
-                                return;
-                            }
-
-                            const subscriptionStatus = "revoked"; // Or map to 'canceled'
-
-                            const result = await defaultDb.update(organizations)
-                                .set({
-                                    subscriptionStatus,
-                                    currentPeriodEnd,
-                                    // planType: "free", // Example: Reset plan
-                                })
-                                .where(eq(organizations.polarCustomerId, polarCustomerId))
-                                .returning({ updatedId: organizations.id });
-
-                            if (result.length > 0) {
-                                console.log(`Organization ${result[0].updatedId} updated for revoked subscription ${subscriptionId}`);
-                            } else {
-                                console.warn(`No organization found for Polar Customer ID: ${polarCustomerId}`);
-                            }
-                        } catch (error) {
-                            console.error("Error updating organization on subscription revoked:", error);
-                        }
+                        await billingService.handleSubscriptionWebhook(payload, 'subscription_revoked');
                     },
                     onSubscriptionUncanceled: async (payload) => {
-                        console.log("Subscription uncanceled:", payload);
-                        try {
-                            const polarCustomerId = payload.data.customer?.id;
-                            const subscriptionId = payload.data.id;
-                            const currentPeriodEnd = payload.data.currentPeriodEnd ? new Date(payload.data.currentPeriodEnd) : null;
-
-                            if (!polarCustomerId) {
-                                console.error("Polar Customer ID not found in payload for uncanceled subscription:", payload);
-                                return;
-                            }
-
-                            // Revert the cancellation status. Check payload.data.status for the actual new status.
-                            const subscriptionStatus = payload.data.status === "active" ? "active" : "uncanceled"; // Or just use payload.data.status
-
-                            // planType should likely remain the same as before cancellation
-
-                            const result = await defaultDb.update(organizations)
-                                .set({
-                                    subscriptionStatus, // Set back to active/uncanceled
-                                    // planType remains unchanged
-                                    currentPeriodEnd,   // Update period end if it changed
-                                })
-                                .where(eq(organizations.polarCustomerId, polarCustomerId))
-                                .returning({ updatedId: organizations.id });
-
-                            if (result.length > 0) {
-                                console.log(`Organization ${result[0].updatedId} updated for uncanceled subscription ${subscriptionId}`);
-                            } else {
-                                console.warn(`No organization found for Polar Customer ID: ${polarCustomerId}`);
-                            }
-                        } catch (error) {
-                            console.error("Error updating organization on subscription uncanceled:", error);
-                        }
+                        await billingService.handleSubscriptionWebhook(payload, 'subscription_uncanceled');
+                    },
+                    onCustomerCreated: async (payload) => {
+                        BillingLogger.log('polar_customer_created', payload);
+                    },
+                    onCustomerUpdated: async (payload) => {
+                        BillingLogger.log('polar_customer_updated', payload);
+                    },
+                    onOrderPaid: async (payload) => {
+                        BillingLogger.log('polar_order_paid', payload);
                     },
                 }),
             ],

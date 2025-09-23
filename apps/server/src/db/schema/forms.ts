@@ -12,8 +12,8 @@ import {
     real,
 } from "drizzle-orm/pg-core";
 import { relations, sql } from "drizzle-orm";
-import { user } from "@/db/schema/auth";
-import {supportedLanguages} from "@/db/schema/localization";
+import { users, organizations } from "@/db/schema/auth";
+import { supportedLanguages } from "@/db/schema/localization";
 
 /* ---------------- Enums ---------------- */
 export const questionTypeEnum = pgEnum("question_type", [
@@ -67,7 +67,8 @@ export const forms = pgTable(
     "forms",
     {
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        userId: text("user_id").notNull().references(() => user.id, { onDelete: "restrict" }),
+        userId: text("user_id").notNull().references(() => users.id, { onDelete: "restrict" }),
+        organizationId: text("organization_id").notNull().references(() => organizations.id, { onDelete: "cascade" }),
 
         // Basic info
         title: text("title").notNull(),
@@ -124,9 +125,15 @@ export const forms = pgTable(
         requirePhoneVerification: boolean("require_phone_verification").notNull().default(false),
         spamProtectionConfig: jsonb("spam_protection_config"),
 
+        // Localization
         defaultLanguage: text("default_language").references(() => supportedLanguages.code, { onDelete: "set null" }),
         availableLanguages: jsonb("available_languages"), // Array of language codes
         autoDetectLanguage: boolean("auto_detect_language").notNull().default(true),
+
+        // Access control for team members
+        visibility: text("visibility").notNull().default("private"), // private, team, public
+        allowedTeamIds: jsonb("allowed_team_ids"), // Array of team IDs that can access this form
+        permissions: jsonb("permissions"), // Fine-grained permissions for team members
 
         // Timestamps
         createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
@@ -136,9 +143,10 @@ export const forms = pgTable(
         // Indexes & unique constraints
         uniqueSlug: uniqueIndex("forms_slug_unique").on(t.slug),
         idxUserStatus: index("forms_user_status_idx").on(t.userId, t.status),
+        idxOrgStatus: index("forms_org_status_idx").on(t.organizationId, t.status),
         idxPublishedActive: index("forms_published_active_idx").on(t.publishedAt).where(sql`${t.status} = 'published'`),
 
-        // CHECK constraints (moved here to avoid self-reference issues)
+        // CHECK constraints
         ck_logo_url: sql`CHECK (${t.logoUrl} IS NULL OR ${t.logoUrl} ~ '^https?://')`,
         ck_primary_color: sql`CHECK (${t.primaryColor} ~ '^#[0-9A-Fa-f]{6}$')`,
         ck_background_color: sql`CHECK (${t.backgroundColor} ~ '^#[0-9A-Fa-f]{6}$')`,
@@ -151,6 +159,8 @@ export const forms = pgTable(
         ck_total_qualified_responses: sql`CHECK (${t.totalQualifiedResponses} >= 0)`,
         ck_completion_rate: sql`CHECK (${t.completionRate} >= 0 AND ${t.completionRate} <= 100)`,
         ck_qualification_rate: sql`CHECK (${t.qualificationRate} >= 0 AND ${t.qualificationRate} <= 100)`,
+
+        ck_visibility: sql`CHECK (${t.visibility} IN ('private', 'team', 'public'))`,
     })
 );
 
@@ -234,7 +244,7 @@ export const formResponses = pgTable(
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
         formId: text("form_id").notNull().references(() => forms.id, { onDelete: "restrict" }),
 
-        respondentUserId: text("respondent_user_id").references(() => user.id, { onDelete: "set null" }),
+        respondentUserId: text("respondent_user_id").references(() => users.id, { onDelete: "set null" }),
         respondentId: text("respondent_id"),
         respondentEmail: text("respondent_email"),
         respondentName: text("respondent_name"),
@@ -278,7 +288,7 @@ export const formResponses = pgTable(
         spamPreventionActions: jsonb("spam_prevention_actions"),
         manualReview: boolean("manual_review").notNull().default(false),
         reviewedAt: timestamp("reviewed_at", { mode: "date" }),
-        reviewedBy: text("reviewed_by").references(() => user.id, { onDelete: "set null" }),
+        reviewedBy: text("reviewed_by").references(() => users.id, { onDelete: "set null" }),
 
         createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
         updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
@@ -416,13 +426,40 @@ export const formIntegrations = pgTable(
     })
 );
 
+/* ---------------- Form Team Access ---------------- */
+export const formTeamAccess = pgTable(
+    "form_team_access",
+    {
+        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
+        formId: text("form_id").notNull().references(() => forms.id, { onDelete: "cascade" }),
+        teamId: text("team_id").notNull(), // References teams table from auth schema
+
+        permissions: jsonb("permissions").notNull(), // Specific permissions for this team
+        canEdit: boolean("can_edit").notNull().default(false),
+        canViewResponses: boolean("can_view_responses").notNull().default(true),
+        canManageIntegrations: boolean("can_manage_integrations").notNull().default(false),
+
+        grantedAt: timestamp("granted_at", { mode: "date" }).notNull().defaultNow(),
+        grantedBy: text("granted_by").notNull().references(() => users.id, { onDelete: "cascade" }),
+
+        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
+        updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
+    },
+    (t) => ({
+        uqFormTeam: uniqueIndex("form_team_access_form_team_uq").on(t.formId, t.teamId),
+        idxTeam: index("form_team_access_team_idx").on(t.teamId),
+    })
+);
+
 /* ---------------- Relations ---------------- */
 export const formsRelations = relations(forms, ({ many, one }) => ({
-    owner: one(user, { fields: [forms.userId], references: [user.id] }),
+    owner: one(users, { fields: [forms.userId], references: [users.id] }),
+    organization: one(organizations, { fields: [forms.organizationId], references: [organizations.id] }),
     questions: many(formQuestions),
     responses: many(formResponses),
     analytics: many(formAnalytics),
     integrations: many(formIntegrations),
+    teamAccess: many(formTeamAccess),
 }));
 
 export const formQuestionsRelations = relations(formQuestions, ({ many, one }) => ({
@@ -437,8 +474,8 @@ export const questionChoicesRelations = relations(questionChoices, ({ one }) => 
 
 export const formResponsesRelations = relations(formResponses, ({ one, many }) => ({
     form: one(forms, { fields: [formResponses.formId], references: [forms.id] }),
-    user: one(user, { fields: [formResponses.respondentUserId], references: [user.id] }),
-    reviewer: one(user, { fields: [formResponses.reviewedBy], references: [user.id] }),
+    user: one(users, { fields: [formResponses.respondentUserId], references: [users.id] }),
+    reviewer: one(users, { fields: [formResponses.reviewedBy], references: [users.id] }),
     answers: many(formAnswers),
 }));
 
@@ -453,4 +490,9 @@ export const formAnalyticsRelations = relations(formAnalytics, ({ one }) => ({
 
 export const formIntegrationsRelations = relations(formIntegrations, ({ one }) => ({
     form: one(forms, { fields: [formIntegrations.formId], references: [forms.id] }),
+}));
+
+export const formTeamAccessRelations = relations(formTeamAccess, ({ one }) => ({
+    form: one(forms, { fields: [formTeamAccess.formId], references: [forms.id] }),
+    grantedByUser: one(users, { fields: [formTeamAccess.grantedBy], references: [users.id] }),
 }));

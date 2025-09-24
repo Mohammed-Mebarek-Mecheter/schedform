@@ -99,6 +99,26 @@ export const calendarConnections = pgTable(
         failedSyncs: integer("failed_syncs").notNull().default(0),
         permissions: jsonb("permissions"), // Access permissions for team/organization
         metadata: jsonb("metadata"), // Additional provider-specific metadata
+
+        // Google-specific additions
+        googleResourceId: text("google_resource_id"), // For watch channels
+        googleSyncToken: text("google_sync_token"), // Incremental sync
+        googleCalendarApiUrl: text("google_calendar_api_url"), // Calendar-specific API endpoint
+
+        // Permission scopes actually granted
+        grantedScopes: jsonb("granted_scopes"), // Array of scope strings
+        scopeVersion: text("scope_version").default("v1"), // API version
+
+        // Token management
+        tokenType: text("token_type").default("Bearer"),
+        idToken: text("id_token"), // For user identification
+        tokenScope: text("token_scope"), // Space-separated scopes
+
+        // Quota management
+        dailyQuotaLimit: integer("daily_quota_limit").default(1000000), // Google's default
+        currentQuotaUsage: integer("current_quota_usage").default(0),
+        quotaResetTime: timestamp("quota_reset_time", { mode: "date" }),
+
         createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
         updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
     },

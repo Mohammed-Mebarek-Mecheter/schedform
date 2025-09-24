@@ -29,9 +29,9 @@ export const triggerTypeEnum = pgEnum("trigger_type", [
     "no_show_detected",
     "scheduled_time",
 ]);
-pgEnum("action_type", [
+
+export const actionTypeEnum = pgEnum("action_type", [
     "send_email",
-    "send_sms",
     "webhook_call",
     "zapier_trigger",
     "create_booking",
@@ -332,47 +332,6 @@ export const emailTemplates = pgTable(
     }),
 );
 
-/* ---------------- SMS Templates ---------------- */
-export const smsTemplates = pgTable(
-    "sms_templates",
-    {
-        id: varchar("id", { length: 36 })
-            .primaryKey()
-            .$defaultFn(() => crypto.randomUUID()),
-
-        userId: text("user_id") // Changed to text to match new auth schema
-            .notNull()
-            .references(() => users.id, { onDelete: "cascade" }),
-
-        name: varchar("name", { length: 255 }).notNull(),
-        description: text("description"),
-        type: varchar("type", { length: 100 }).notNull(),
-
-        message: varchar("message", { length: 1000 }).notNull(),
-        variables: jsonb("variables"),
-
-        defaultLanguage: varchar("default_language", { length: 10 }).references(() => supportedLanguages.code, { onDelete: "set null" }),
-        supportedLanguages: jsonb("supported_languages"),
-        autoDetectLanguage: boolean("auto_detect_language").default(true),
-
-        isDefault: boolean("is_default").default(false),
-        isActive: boolean("is_active").default(true),
-
-        totalSent: integer("total_sent").default(0),
-        lastUsed: timestamp("last_used"),
-
-        createdAt: timestamp("created_at").notNull().defaultNow(),
-        updatedAt: timestamp("updated_at").notNull().defaultNow(),
-    },
-    (t) => ({
-        userIdx: index("sms_templates_user_idx").on(t.userId),
-        uniqueName: uniqueIndex("sms_templates_user_name_idx").on(
-            t.userId,
-            t.name,
-        ),
-    }),
-);
-
 /* ---------------- Notification Queue ---------------- */
 export const notificationQueue = pgTable(
     "notification_queue",
@@ -385,7 +344,7 @@ export const notificationQueue = pgTable(
             .notNull()
             .references(() => users.id, { onDelete: "cascade" }),
 
-        type: varchar("type", { length: 50 }).notNull(), // email, sms, slack
+        type: varchar("type", { length: 50 }).notNull(), // email, slack
         recipient: varchar("recipient", { length: 255 }).notNull(),
         subject: varchar("subject", { length: 255 }),
         message: text("message").notNull(),
@@ -521,30 +480,6 @@ export const emailTemplateTranslations = pgTable(
     })
 );
 
-/* ---------------- SMS Template Translations ---------------- */
-export const smsTemplateTranslations = pgTable(
-    "sms_template_translations",
-    {
-        id: varchar("id", { length: 36 }).primaryKey().$defaultFn(() => crypto.randomUUID()),
-        templateId: varchar("template_id", { length: 36 }).notNull().references(() => smsTemplates.id, { onDelete: "cascade" }),
-        languageCode: text("language_code").notNull().references(() => supportedLanguages.code, { onDelete: "restrict" }),
-
-        message: varchar("message", { length: 1000 }),
-        localizedVariables: jsonb("localized_variables"),
-
-        status: text("status").notNull().default("draft"),
-        translatedBy: text("translated_by").references(() => users.id, { onDelete: "set null" }), // Changed to text
-        reviewedBy: text("reviewed_by").references(() => users.id, { onDelete: "set null" }), // Changed to text
-
-        createdAt: timestamp("created_at").notNull().defaultNow(),
-        updatedAt: timestamp("updated_at").notNull().defaultNow(),
-    },
-    (t) => ({
-        uqTemplateLanguage: uniqueIndex("sms_template_translations_template_language_uq").on(t.templateId, t.languageCode),
-        idxLanguage: index("sms_template_translations_language_idx").on(t.languageCode),
-    })
-);
-
 /* ---------------- Automation Rule Translations ---------------- */
 export const automationRuleTranslations = pgTable(
     "automation_rule_translations",
@@ -647,15 +582,6 @@ export const emailTemplatesRelations = relations(emailTemplates, ({ one, many })
     }),
 }));
 
-export const smsTemplatesRelations = relations(smsTemplates, ({ one, many }) => ({
-    owner: one(users, { fields: [smsTemplates.userId], references: [users.id] }), // Updated to users
-    translations: many(smsTemplateTranslations),
-    defaultLanguageRef: one(supportedLanguages, {
-        fields: [smsTemplates.defaultLanguage],
-        references: [supportedLanguages.code],
-    }),
-}));
-
 export const notificationQueueRelations = relations(
     notificationQueue,
     ({ one }) => ({
@@ -697,25 +623,6 @@ export const emailTemplateTranslationsRelations = relations(emailTemplateTransla
     }),
     reviewer: one(users, { // Updated to users
         fields: [emailTemplateTranslations.reviewedBy],
-        references: [users.id]
-    }),
-}));
-
-export const smsTemplateTranslationsRelations = relations(smsTemplateTranslations, ({ one }) => ({
-    template: one(smsTemplates, {
-        fields: [smsTemplateTranslations.templateId],
-        references: [smsTemplates.id]
-    }),
-    language: one(supportedLanguages, {
-        fields: [smsTemplateTranslations.languageCode],
-        references: [supportedLanguages.code]
-    }),
-    translator: one(users, { // Updated to users
-        fields: [smsTemplateTranslations.translatedBy],
-        references: [users.id]
-    }),
-    reviewer: one(users, { // Updated to users
-        fields: [smsTemplateTranslations.reviewedBy],
         references: [users.id]
     }),
 }));

@@ -158,7 +158,6 @@ export const eventTypes = pgTable(
         singleUseLinks: boolean("single_use_links").notNull().default(false),
         enableAiOptimization: boolean("enable_ai_optimization").notNull().default(true),
         requireEmailVerification: boolean("require_email_verification").notNull().default(true),
-        requireSmsVerification: boolean("require_sms_verification").notNull().default(false),
         highValueThreshold: integer("high_value_threshold"),
         customBranding: boolean("custom_branding").notNull().default(false),
         primaryColor: text("primary_color").notNull().default("#3b82f6"),
@@ -190,7 +189,7 @@ export const eventTypes = pgTable(
         idxTeam: index("event_types_team_idx").on(t.teamId).where(sql`${t.teamId} IS NOT NULL`),
         idxForm: index("event_types_form_idx").on(t.formId).where(sql`${t.formId} IS NOT NULL`),
 
-        // ✅ move checks here
+        // âœ… move checks here
         chkDuration: sql`CHECK (${t.duration} > 0 AND ${t.duration} <= 1440)`,
         chkBufferBefore: sql`CHECK (${t.bufferTimeBefore} >= 0 AND ${t.bufferTimeBefore} <= 240)`,
         chkBufferAfter: sql`CHECK (${t.bufferTimeAfter} >= 0 AND ${t.bufferTimeAfter} <= 240)`,
@@ -432,10 +431,6 @@ export const bookings = pgTable(
         emailVerificationToken: text("email_verification_token"),
         emailVerifiedAt: timestamp("email_verified_at", { mode: "date" }),
 
-        smsVerified: boolean("sms_verified").notNull().default(false),
-        smsVerificationToken: text("sms_verification_token"),
-        smsVerifiedAt: timestamp("sms_verified_at", { mode: "date" }),
-
         externalCalendarEventId: text("external_calendar_event_id"),
         calendarEventCreated: boolean("calendar_event_created")
             .notNull()
@@ -511,7 +506,7 @@ export const bookings = pgTable(
 );
 
 /**
- * Booking reminders - simplified with organization context
+ * Booking reminders - simplified with organization context (EMAIL ONLY)
  */
 export const bookingReminders = pgTable(
     "booking_reminders",
@@ -524,7 +519,7 @@ export const bookingReminders = pgTable(
             .notNull()
             .references(() => organizations.id, { onDelete: "cascade" }),
 
-        type: text("type").notNull(), // 'email' | 'sms' | 'both' | 'push'
+        type: text("type").notNull().default("email"), // 'email' | 'push' (SMS removed)
         triggerMinutes: integer("trigger_minutes").notNull(), // Minutes before meeting
 
         // Configuration
@@ -562,6 +557,7 @@ export const bookingReminders = pgTable(
             .on(t.status, t.sentAt)
             .where(sql`${t.status} = 'pending'`),
         chkTriggerMinutes: sql`CHECK (${t.triggerMinutes} > 0)`,
+        chkType: sql`CHECK (${t.type} IN ('email', 'push'))`, // SMS removed
     }),
 );
 
@@ -854,10 +850,9 @@ export const bookingStatusMessages = pgTable(
         statusKey: text("status_key").notNull(), // "confirmed", "cancelled", "no_show", etc.
         languageCode: text("language_code").notNull().references(() => supportedLanguages.code, { onDelete: "restrict" }),
 
-        // Different message types for each status
+        // Different message types for each status (EMAIL ONLY)
         emailSubject: text("email_subject"),
         emailBody: text("email_body"),
-        smsMessage: text("sms_message"),
         inAppMessage: text("in_app_message"),
 
         // Context-specific variables

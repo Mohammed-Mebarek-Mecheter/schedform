@@ -49,7 +49,8 @@ export const reviewStatusEnum = pgEnum("review_status", [
     "auto_approved",
     "requires_human",
 ]);
-pgEnum("fraud_indicator", [
+
+export const fraudIndicatorEnum = pgEnum("fraud_indicator", [
     "suspicious_email",
     "disposable_email",
     "vpn_usage",
@@ -85,8 +86,6 @@ export const blockReasonEnum = pgEnum("block_reason", [
 export const verificationMethodEnum = pgEnum("verification_method", [
     "email_link",
     "email_code",
-    "sms_code",
-    "phone_call",
     "captcha",
     "manual_review",
 ]);
@@ -336,100 +335,6 @@ export const emailVerifications = pgTable(
 );
 
 /**
- * SMS Verifications - Enhanced tracking
- */
-export const smsVerifications = pgTable(
-    "sms_verifications",
-    {
-        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        formResponseId: text("form_response_id")
-            .references(() => formResponses.id, { onDelete: "cascade" }),
-        bookingId: text("booking_id")
-            .references(() => bookings.id, { onDelete: "cascade" }),
-        spamAssessmentId: text("spam_assessment_id")
-            .references(() => spamAssessments.id, { onDelete: "cascade" }),
-        organizationId: text("organization_id").references(() => organizations.id, { onDelete: "cascade" }),
-
-        phone: text("phone").notNull(),
-        normalizedPhone: text("normalized_phone").notNull(), // E.164 format
-        verificationCode: varchar("verification_code", { length: 10 }).notNull(),
-
-        status: verificationStatusEnum("status").notNull().default("pending"),
-        method: verificationMethodEnum("method").notNull().default("sms_code"),
-        attempts: integer("attempts").notNull().default(0),
-        maxAttempts: integer("max_attempts").notNull().default(3),
-
-        sentAt: timestamp("sent_at", { mode: "date" }),
-        verifiedAt: timestamp("verified_at", { mode: "date" }),
-        expiresAt: timestamp("expires_at", { mode: "date" }).notNull(),
-
-        // Phone analysis and validation (consolidated)
-        phoneCarrier: text("phone_carrier"),
-        phoneType: text("phone_type"), // mobile, landline, voip, toll_free
-        phoneCountry: varchar("phone_country", { length: 2 }),
-        phoneRegion: text("phone_region"),
-        isValidPhone: boolean("is_valid_phone").notNull().default(true),
-        isRiskyPhone: boolean("is_risky_phone").notNull().default(false),
-        phoneReputationScore: integer("phone_reputation_score"),
-
-        // Delivery tracking (simplified)
-        smsProvider: text("sms_provider"),
-        deliveryStatus: text("delivery_status"), // delivered, failed, undelivered
-        deliveryError: text("delivery_error"),
-        deliveryAttempts: integer("delivery_attempts").notNull().default(0),
-        smsCost: real("sms_cost"),
-
-        // Security tracking (essential only)
-        verificationIP: varchar("verification_ip", { length: 45 }),
-        verificationUserAgent: text("verification_user_agent"),
-        verificationLocation: jsonb("verification_location"),
-
-        // Rate limiting
-        dailyVerificationCount: integer("daily_verification_count").notNull().default(1),
-        isRateLimited: boolean("is_rate_limited").notNull().default(false),
-
-        // External service tracking
-        externalMessageId: text("external_message_id"),
-        messageSegments: integer("message_segments").default(1),
-
-        detectedLanguage: text("detected_language").references(() => supportedLanguages.code, { onDelete: "set null" }),
-        preferredLanguage: text("preferred_language").references(() => supportedLanguages.code, { onDelete: "set null" }),
-
-        // Localized SMS content
-        localizedMessage: text("localized_message"),
-        localizedInstructions: text("localized_instructions"),
-
-        // Regional SMS preferences
-        preferredSmsFormat: text("preferred_sms_format"), // compact, detailed, etc.
-        culturalContext: jsonb("cultural_context"),
-
-        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
-        updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
-    },
-    (t) => ({
-        idxNormalizedPhone: index("sms_verifications_normalized_phone_idx")
-            .on(t.normalizedPhone),
-        idxStatusExpiry: index("sms_verifications_status_expiry_idx")
-            .on(t.status, t.expiresAt),
-        idxCarrierCountry: index("sms_verifications_carrier_country_idx")
-            .on(t.phoneCarrier, t.phoneCountry)
-            .where(sql`${t.phoneCarrier} IS NOT NULL`),
-        idxDeliveryStatus: index("sms_verifications_delivery_idx")
-            .on(t.deliveryStatus, t.createdAt),
-        idxOrgStatus: index("sms_verifications_org_status_idx").on(t.organizationId, t.status),
-
-        // Constraints
-        chkAttempts: sql`CHECK (${t.attempts} >= 0)`,
-        chkMaxAttempts: sql`CHECK (${t.maxAttempts} > 0)`,
-        chkPhoneReputationScore: sql`CHECK (${t.phoneReputationScore} IS NULL OR (${t.phoneReputationScore} >= 0 AND ${t.phoneReputationScore} <= 100))`,
-        chkDeliveryAttempts: sql`CHECK (${t.deliveryAttempts} >= 0)`,
-        chkSmsCost: sql`CHECK (${t.smsCost} IS NULL OR ${t.smsCost} >= 0)`,
-        chkDailyVerificationCount: sql`CHECK (${t.dailyVerificationCount} >= 1)`,
-        chkMessageSegments: sql`CHECK (${t.messageSegments} >= 1)`,
-    })
-);
-
-/**
  * Blocked Entities - Enhanced tracking (essential fields only)
  */
 export const blockedEntities = pgTable(
@@ -541,11 +446,9 @@ export const spamPreventionAnalytics = pgTable(
         blockedSubmissions: integer("blocked_submissions").notNull().default(0),
         flaggedSubmissions: integer("flagged_submissions").notNull().default(0),
 
-        // Verification statistics
+        // Email verification statistics only
         emailVerificationsRequested: integer("email_verifications_requested").notNull().default(0),
         emailVerificationsCompleted: integer("email_verifications_completed").notNull().default(0),
-        smsVerificationsRequested: integer("sms_verifications_requested").notNull().default(0),
-        smsVerificationsCompleted: integer("sms_verifications_completed").notNull().default(0),
 
         // Quality scores with validation
         averageSpamScore: real("average_spam_score").notNull().default(0),
@@ -566,7 +469,7 @@ export const spamPreventionAnalytics = pgTable(
         manualReviewsCompleted: integer("manual_reviews_completed").notNull().default(0),
         averageReviewTime: integer("average_review_time"),
 
-        // Cost tracking
+        // Cost tracking (email only)
         verificationCosts: real("verification_costs").notNull().default(0),
         externalServiceCosts: real("external_service_costs").notNull().default(0),
 
@@ -597,8 +500,6 @@ export const spamPreventionAnalytics = pgTable(
         chkFlaggedSubmissions: sql`CHECK (${t.flaggedSubmissions} >= 0)`,
         chkEmailVerificationsRequested: sql`CHECK (${t.emailVerificationsRequested} >= 0)`,
         chkEmailVerificationsCompleted: sql`CHECK (${t.emailVerificationsCompleted} >= 0)`,
-        chkSmsVerificationsRequested: sql`CHECK (${t.smsVerificationsRequested} >= 0)`,
-        chkSmsVerificationsCompleted: sql`CHECK (${t.smsVerificationsCompleted} >= 0)`,
         chkAverageSpamScore: sql`CHECK (${t.averageSpamScore} >= 0 AND ${t.averageSpamScore} <= 100)`,
         chkAverageQualityScore: sql`CHECK (${t.averageQualityScore} >= 0 AND ${t.averageQualityScore} <= 100)`,
         chkSpamDetectionAccuracy: sql`CHECK (${t.spamDetectionAccuracy} >= 0 AND ${t.spamDetectionAccuracy} <= 100)`,
@@ -621,15 +522,12 @@ export const verificationMessageTranslations = pgTable(
     {
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
 
-        messageType: text("message_type").notNull(), // "email_verification", "sms_verification", "blocked_entity"
+        messageType: text("message_type").notNull(), // "email_verification", "blocked_entity"
         languageCode: text("language_code").notNull().references(() => supportedLanguages.code, { onDelete: "restrict" }),
 
-        // Email verification messages
+        // Email verification messages only
         emailSubject: text("email_subject"),
         emailBody: text("email_body"),
-
-        // SMS verification messages
-        smsMessage: text("sms_message"),
 
         // Blocked entity messages
         blockedMessage: text("blocked_message"),
@@ -789,12 +687,9 @@ export const spamAssessmentsRelations = relations(spamAssessments, ({ one, many 
     translations: many(spamAssessmentTranslations, {
         relationName: "spam_assessment_translations"
     }),
-    // Assuming there might be a link to email/sms verifications if they reference this assessment
+    // Only email verifications now
     emailVerifications: many(emailVerifications, {
         relationName: "spam_assessment_email_verifications"
-    }),
-    smsVerifications: many(smsVerifications, {
-        relationName: "spam_assessment_sms_verifications"
     }),
 }));
 
@@ -828,39 +723,6 @@ export const emailVerificationsRelations = relations(emailVerifications, ({ one 
         fields: [emailVerifications.preferredLanguage],
         references: [supportedLanguages.code],
         relationName: "email_verification_preferred_language"
-    }),
-}));
-
-export const smsVerificationsRelations = relations(smsVerifications, ({ one }) => ({
-    formResponse: one(formResponses, {
-        fields: [smsVerifications.formResponseId],
-        references: [formResponses.id],
-        relationName: "sms_verification_form_response"
-    }),
-    booking: one(bookings, {
-        fields: [smsVerifications.bookingId],
-        references: [bookings.id],
-        relationName: "sms_verification_booking"
-    }),
-    spamAssessment: one(spamAssessments, {
-        fields: [smsVerifications.spamAssessmentId],
-        references: [spamAssessments.id],
-        relationName: "sms_verification_spam_assessment"
-    }),
-    organization: one(organizations, {
-        fields: [smsVerifications.organizationId],
-        references: [organizations.id],
-        relationName: "sms_verification_organization"
-    }),
-    detectedLanguageRef: one(supportedLanguages, {
-        fields: [smsVerifications.detectedLanguage],
-        references: [supportedLanguages.code],
-        relationName: "sms_verification_detected_language"
-    }),
-    preferredLanguageRef: one(supportedLanguages, {
-        fields: [smsVerifications.preferredLanguage],
-        references: [supportedLanguages.code],
-        relationName: "sms_verification_preferred_language"
     }),
 }));
 
@@ -908,7 +770,7 @@ export const spamPreventionAnalyticsRelations = relations(spamPreventionAnalytic
     }),
 }));
 
-// These relations for translation tables seem mostly correct, assuming `supportedLanguages` is imported correctly.
+// Relations for translation tables
 export const verificationMessageTranslationsRelations = relations(verificationMessageTranslations, ({ one }) => ({
     language: one(supportedLanguages, {
         fields: [verificationMessageTranslations.languageCode],

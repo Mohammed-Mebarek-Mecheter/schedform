@@ -122,13 +122,10 @@ export const conversationalFlows = pgTable(
             .references(() => users.id, { onDelete: "set null" }), // Updated reference
         approvedAt: timestamp("approved_at", { mode: "date" }),
 
-        // Email/SMS Verification for high-value bookings
+        // Email verification for high-value bookings
         emailVerificationRequired: boolean("email_verification_required").notNull().default(false),
         emailVerificationSentAt: timestamp("email_verification_sent_at", { mode: "date" }),
         emailVerifiedAt: timestamp("email_verified_at", { mode: "date" }),
-        smsVerificationRequired: boolean("sms_verification_required").notNull().default(false),
-        smsVerificationSentAt: timestamp("sms_verification_sent_at", { mode: "date" }),
-        smsVerifiedAt: timestamp("sms_verified_at", { mode: "date" }),
 
         // Abandonment and Recovery
         lastActiveAt: timestamp("last_active_at", { mode: "date" }).notNull().defaultNow(),

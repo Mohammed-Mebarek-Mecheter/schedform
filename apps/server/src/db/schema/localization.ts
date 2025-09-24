@@ -338,8 +338,8 @@ export const translationTemplates = pgTable(
     {
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
 
-        templateKey: text("template_key").notNull(), // "booking_confirmation_email", "reminder_sms", etc.
-        category: text("category").notNull(), // "email", "sms", "ui", "error", "validation"
+        templateKey: text("template_key").notNull(), // "booking_confirmation_email", "reminder_email", etc.
+        category: text("category").notNull(), // "email", "ui", "error", "validation" (SMS removed)
 
         // Default content (fallback language)
         defaultLanguage: text("default_language").notNull().references(() => supportedLanguages.code, { onDelete: "restrict" }),
@@ -365,6 +365,9 @@ export const translationTemplates = pgTable(
         idxCategory: index("translation_templates_category_idx").on(t.category),
         idxSystem: index("translation_templates_system_idx").on(t.isSystemTemplate),
         idxOrganization: index("translation_templates_organization_idx").on(t.organizationId),
+
+        // Updated constraint to remove SMS category
+        chkCategory: sql`CHECK (${t.category} IN ('email', 'ui', 'error', 'validation'))`,
     })
 );
 
@@ -434,7 +437,7 @@ export const workflowTranslations = pgTable(
         name: text("name"),
         description: text("description"),
 
-        // Translated workflow definition with localized messages
+        // Translated workflow definition with localized messages (SMS actions removed)
         workflowDefinition: jsonb("workflow_definition"),
 
         status: translationStatusEnum("status").notNull().default("draft"),
@@ -539,10 +542,10 @@ export const translationStatistics = pgTable(
         cacheMisses: integer("cache_misses").notNull().default(0),
         detectionRequests: integer("detection_requests").notNull().default(0),
 
-        // Content statistics
+        // Content statistics (SMS templates removed)
         formsTranslated: integer("forms_translated").notNull().default(0),
         questionsTranslated: integer("questions_translated").notNull().default(0),
-        templatesTranslated: integer("templates_translated").notNull().default(0),
+        emailTemplatesTranslated: integer("email_templates_translated").notNull().default(0),
 
         // Performance metrics
         averageDetectionTime: integer("average_detection_time"), // Milliseconds
@@ -566,7 +569,7 @@ export const translationStatistics = pgTable(
         chkDetectionRequests: sql`CHECK (${t.detectionRequests} >= 0)`,
         chkFormsTranslated: sql`CHECK (${t.formsTranslated} >= 0)`,
         chkQuestionsTranslated: sql`CHECK (${t.questionsTranslated} >= 0)`,
-        chkTemplatesTranslated: sql`CHECK (${t.templatesTranslated} >= 0)`,
+        chkEmailTemplatesTranslated: sql`CHECK (${t.emailTemplatesTranslated} >= 0)`,
         chkAverageDetectionTime: sql`CHECK (${t.averageDetectionTime} IS NULL OR ${t.averageDetectionTime} >= 0)`,
         chkAverageTranslationTime: sql`CHECK (${t.averageTranslationTime} IS NULL OR ${t.averageTranslationTime} >= 0)`,
         chkTranslationErrors: sql`CHECK (${t.translationErrors} >= 0)`,
@@ -582,6 +585,10 @@ export const supportedLanguagesRelations = relations(supportedLanguages, ({ many
     eventTypeTranslations: many(eventTypeTranslations),
     userPreferences: many(userLanguagePreferences),
     organizationSettings: many(organizationLanguageSettings),
+    translationTemplates: many(translationTemplates),
+    translationTemplateContent: many(translationTemplateContent),
+    systemMessageTranslations: many(systemMessageTranslations),
+    workflowTranslations: many(workflowTranslations),
 }));
 
 export const formTranslationsRelations = relations(formTranslations, ({ one }) => ({
@@ -610,6 +617,8 @@ export const regionalSettingsRelations = relations(regionalSettings, ({ one }) =
     user: one(users, { fields: [regionalSettings.userId], references: [users.id] }),
     organization: one(organizations, { fields: [regionalSettings.organizationId], references: [organizations.id] }),
     team: one(teams, { fields: [regionalSettings.teamId], references: [teams.id] }),
+    defaultLanguage: one(supportedLanguages, { fields: [regionalSettings.defaultLanguage], references: [supportedLanguages.code] }),
+    fallbackLanguage: one(supportedLanguages, { fields: [regionalSettings.fallbackLanguage], references: [supportedLanguages.code] }),
 }));
 
 export const userLanguagePreferencesRelations = relations(userLanguagePreferences, ({ one }) => ({

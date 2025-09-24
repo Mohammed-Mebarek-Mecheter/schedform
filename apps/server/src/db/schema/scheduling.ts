@@ -16,6 +16,7 @@ import { relations, sql } from "drizzle-orm";
 import { users, organizations, teams } from "@/db/schema/auth";
 import { formResponses, forms } from "@/db/schema/forms";
 import { eventTypeTranslations, supportedLanguages } from "@/db/schema/localization";
+import { calendarConnections } from "./calendar-core";
 
 /* ============================
    Enums (Postgres pg_enum types)
@@ -38,13 +39,6 @@ export const bookingStatusEnum = pgEnum("booking_status", [
     "rejected", // Host rejected the booking request
 ]);
 
-export const calendarProviderEnum = pgEnum("calendar_provider", [
-    "google",
-    "outlook",
-    "apple",
-    "caldav",
-]);
-
 export const meetingTypeEnum = pgEnum("meeting_type", [
     "phone",
     "video",
@@ -65,74 +59,6 @@ export const noShowReasonEnum = pgEnum("no_show_reason", [
 /* ============================
    Tables
    ============================ */
-
-/**
- * Calendar connections - per-user calendar OAuth connections with organization context
- */
-export const calendarConnections = pgTable(
-    "calendar_connections",
-    {
-        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        userId: text("user_id")
-            .notNull()
-            .references(() => users.id, { onDelete: "cascade" }),
-        organizationId: text("organization_id")
-            .notNull()
-            .references(() => organizations.id, { onDelete: "cascade" }),
-        teamId: text("team_id")
-            .references(() => teams.id, { onDelete: "set null" }),
-        provider: calendarProviderEnum("provider").notNull(),
-        name: text("name").notNull(),
-        email: text("email").notNull(),
-        accessToken: text("access_token").notNull(),
-        refreshToken: text("refresh_token"),
-        tokenExpiresAt: timestamp("token_expires_at", { mode: "date" }),
-        calendarId: text("calendar_id").notNull(),
-        timeZone: text("time_zone").notNull(),
-        isDefault: boolean("is_default").notNull().default(false),
-        isActive: boolean("is_active").notNull().default(true),
-        isPersonal: boolean("is_personal").notNull().default(false),
-        lastSyncAt: timestamp("last_sync_at", { mode: "date" }),
-        syncStatus: text("sync_status").notNull().default("pending"),
-        syncErrors: jsonb("sync_errors"),
-        totalBookings: integer("total_bookings").notNull().default(0),
-        failedSyncs: integer("failed_syncs").notNull().default(0),
-        permissions: jsonb("permissions"), // Access permissions for team/organization
-        metadata: jsonb("metadata"), // Additional provider-specific metadata
-
-        // Google-specific additions
-        googleResourceId: text("google_resource_id"), // For watch channels
-        googleSyncToken: text("google_sync_token"), // Incremental sync
-        googleCalendarApiUrl: text("google_calendar_api_url"), // Calendar-specific API endpoint
-
-        // Permission scopes actually granted
-        grantedScopes: jsonb("granted_scopes"), // Array of scope strings
-        scopeVersion: text("scope_version").default("v1"), // API version
-
-        // Token management
-        tokenType: text("token_type").default("Bearer"),
-        idToken: text("id_token"), // For user identification
-        tokenScope: text("token_scope"), // Space-separated scopes
-
-        // Quota management
-        dailyQuotaLimit: integer("daily_quota_limit").default(1000000), // Google's default
-        currentQuotaUsage: integer("current_quota_usage").default(0),
-        quotaResetTime: timestamp("quota_reset_time", { mode: "date" }),
-
-        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
-        updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
-    },
-    (t) => ({
-        idxUser: index("calendar_connections_user_idx").on(t.userId),
-        idxOrganization: index("calendar_connections_organization_idx").on(t.organizationId),
-        idxTeam: index("calendar_connections_team_idx").on(t.teamId).where(sql`${t.teamId} IS NOT NULL`),
-        uqUserDefault: uniqueIndex("calendar_connections_user_default_uq")
-            .on(t.userId, t.isDefault)
-            .where(sql`${t.isDefault} = true`),
-        chkEmail: sql`CHECK (${t.email} ~ '^[^@]+@[^@]+\\.[^@]+')`,
-        chkTotals: sql`CHECK (${t.totalBookings} >= 0 AND ${t.failedSyncs} >= 0)`,
-    }),
-);
 
 /**
  * Event types - meeting templates with organization and team context
@@ -917,15 +843,6 @@ export const timezoneTranslations = pgTable(
 /* ============================
    Relations (type-safe helpers)
    ============================ */
-
-export const calendarConnectionsRelations = relations(calendarConnections, ({ one, many }) => ({
-    user: one(users, { fields: [calendarConnections.userId], references: [users.id] }),
-    organization: one(organizations, { fields: [calendarConnections.organizationId], references: [organizations.id] }),
-    team: one(teams, { fields: [calendarConnections.teamId], references: [teams.id] }),
-    availabilitySlots: many(availabilitySlots),
-    bookings: many(bookings),
-    blockedTimes: many(blockedTimes),
-}));
 
 export const eventTypesRelations = relations(eventTypes, ({ one, many }) => ({
     owner: one(users, { fields: [eventTypes.userId], references: [users.id] }),

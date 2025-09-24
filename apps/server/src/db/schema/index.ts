@@ -23,3 +23,6 @@ export * from "./workflows";
 
 // Localization
 export * from "./localization";
+
+// Calendar
+export * from "./calendar-core";

@@ -3,8 +3,8 @@ import type {CalendarService, CalendarEvent, GoogleCalendarConfig} from '../../t
 import { google } from 'googleapis';
 import { OAuth2Client } from 'google-auth-library';
 import {db} from "@/db";
-import {calendarConnections} from "@/db/schema";
-import {eq} from "drizzle-orm";
+import {calendarConnections, externalCalendarEvents} from "@/db/schema";
+import {and, eq, sql} from "drizzle-orm";
 import {googleWebhookChannels} from "@/db/schema/calendar-core";
 
 export class GoogleCalendarService implements CalendarService {
@@ -20,9 +20,20 @@ export class GoogleCalendarService implements CalendarService {
         this.calendar = google.calendar({ version: 'v3', auth: this.auth });
     }
 
+    private async ensureValidToken(connectionId: string): Promise<void> {
+        const connection = await this.getConnection(connectionId);
+
+        // Check if token is expired or about to expire (within 5 minutes)
+        if (connection.tokenExpiresAt && new Date(connection.tokenExpiresAt) < new Date(Date.now() + 5 * 60 * 1000)) {
+            await this.refreshTokens(connectionId);
+        }
+    }
+
     async validateConnection(connectionId: string): Promise<boolean> {
         try {
-            const connection = await this.getConnectionTokens(connectionId);
+            await this.ensureValidToken(connectionId);
+            const connection = await this.getConnection(connectionId);
+
             this.auth.setCredentials({
                 access_token: connection.accessToken,
                 refresh_token: connection.refreshToken,
@@ -33,12 +44,13 @@ export class GoogleCalendarService implements CalendarService {
             return true;
         } catch (error) {
             console.error('Google Calendar connection validation failed:', error);
+            await this.handleConnectionError(connectionId, error);
             return false;
         }
     }
 
     async refreshTokens(connectionId: string): Promise<void> {
-        const connection = await this.getConnectionTokens(connectionId);
+        const connection = await this.getConnection(connectionId);
         this.auth.setCredentials({
             access_token: connection.accessToken,
             refresh_token: connection.refreshToken,
@@ -51,13 +63,17 @@ export class GoogleCalendarService implements CalendarService {
             await db.update(calendarConnections)
                 .set({
                     accessToken: credentials.access_token!,
+                    refreshToken: credentials.refresh_token || connection.refreshToken,
                     tokenExpiresAt: new Date(credentials.expiry_date!),
                     updatedAt: new Date(),
+                    consecutiveFailures: 0,
+                    lastError: null,
                 })
                 .where(eq(calendarConnections.id, connectionId));
 
         } catch (error) {
             console.error('Token refresh failed:', error);
+            await this.handleTokenRefreshError(connectionId, error);
             throw new Error('Failed to refresh Google Calendar tokens');
         }
     }
@@ -73,35 +89,48 @@ export class GoogleCalendarService implements CalendarService {
         nextSyncToken?: string;
         nextPageToken?: string;
     }> {
-        await this.setupAuth(params.connectionId);
+        await this.ensureValidToken(params.connectionId);
         const connection = await this.getConnection(params.connectionId);
 
         try {
-            const response = await this.calendar.events.list({
+            const requestParams: any = {
                 calendarId: connection.calendarId,
-                timeMin: params.timeMin?.toISOString(),
-                timeMax: params.timeMax?.toISOString(),
                 maxResults: params.maxResults || 250,
-                syncToken: params.syncToken,
                 singleEvents: true,
                 orderBy: 'startTime',
-            });
+            };
 
-            const events = response.data.items?.map(this.normalizeGoogleEvent) || [];
+            if (params.syncToken) {
+                requestParams.syncToken = params.syncToken;
+            } else {
+                if (params.timeMin) requestParams.timeMin = params.timeMin.toISOString();
+                if (params.timeMax) requestParams.timeMax = params.timeMax.toISOString();
+            }
+
+            const response = await this.calendar.events.list(requestParams);
+
+            const events = response.data.items?.map((event: any) => this.normalizeGoogleEvent(event)) || [];
 
             return {
                 events,
                 nextSyncToken: response.data.nextSyncToken,
                 nextPageToken: response.data.nextPageToken,
             };
-        } catch (error) {
+        } catch (error: any) {
+            if (error.code === 410) { // Sync token is invalid
+                // Retry without sync token
+                return this.listEvents({
+                    ...params,
+                    syncToken: undefined
+                });
+            }
             console.error('Failed to list Google Calendar events:', error);
-            throw error;
+            throw this.normalizeGoogleError(error);
         }
     }
 
     async createEvent(connectionId: string, event: Partial<CalendarEvent>): Promise<CalendarEvent> {
-        await this.setupAuth(connectionId);
+        await this.ensureValidToken(connectionId);
         const connection = await this.getConnection(connectionId);
 
         const googleEvent = this.convertToGoogleEvent(event);
@@ -115,7 +144,80 @@ export class GoogleCalendarService implements CalendarService {
             return this.normalizeGoogleEvent(response.data);
         } catch (error) {
             console.error('Failed to create Google Calendar event:', error);
-            throw error;
+            throw this.normalizeGoogleError(error);
+        }
+    }
+
+    async updateEvent(connectionId: string, eventId: string, updates: Partial<CalendarEvent>): Promise<CalendarEvent> {
+        await this.ensureValidToken(connectionId);
+        const connection = await this.getConnection(connectionId);
+
+        const googleEvent = this.convertToGoogleEvent(updates);
+
+        try {
+            const response = await this.calendar.events.update({
+                calendarId: connection.calendarId,
+                eventId: eventId,
+                resource: googleEvent,
+            });
+
+            return this.normalizeGoogleEvent(response.data);
+        } catch (error) {
+            console.error('Failed to update Google Calendar event:', error);
+            throw this.normalizeGoogleError(error);
+        }
+    }
+
+    async deleteEvent(connectionId: string, eventId: string): Promise<void> {
+        await this.ensureValidToken(connectionId);
+        const connection = await this.getConnection(connectionId);
+
+        try {
+            await this.calendar.events.delete({
+                calendarId: connection.calendarId,
+                eventId: eventId,
+            });
+        } catch (error) {
+            console.error('Failed to delete Google Calendar event:', error);
+            throw this.normalizeGoogleError(error);
+        }
+    }
+
+    async getFreeBusyInfo(params: {
+        connectionId: string;
+        timeMin: Date;
+        timeMax: Date;
+        calendars?: string[];
+    }): Promise<{
+        calendar: string;
+        busy: Array<{ start: Date; end: Date }>;
+        errors: Array<{ domain: string; reason: string }>;
+    }[]> {
+        await this.ensureValidToken(params.connectionId);
+        const connection = await this.getConnection(params.connectionId);
+
+        const calendarsToCheck = params.calendars || [connection.calendarId];
+
+        try {
+            const response = await this.calendar.freebusy.query({
+                resource: {
+                    timeMin: params.timeMin.toISOString(),
+                    timeMax: params.timeMax.toISOString(),
+                    items: calendarsToCheck.map(calendarId => ({ id: calendarId })),
+                },
+            });
+
+            return Object.entries(response.data.calendars || {}).map(([calendarId, calendarData]: [string, any]) => ({
+                calendar: calendarId,
+                busy: (calendarData.busy || []).map((busySlot: any) => ({
+                    start: new Date(busySlot.start),
+                    end: new Date(busySlot.end),
+                })),
+                errors: calendarData.errors || [],
+            }));
+        } catch (error) {
+            console.error('Failed to get Google free/busy info:', error);
+            throw this.normalizeGoogleError(error);
         }
     }
 
@@ -123,7 +225,7 @@ export class GoogleCalendarService implements CalendarService {
         webhookId: string;
         expirationTime: Date;
     }> {
-        await this.setupAuth(connectionId);
+        await this.ensureValidToken(connectionId);
         const connection = await this.getConnection(connectionId);
 
         const channelId = `webhook-${connectionId}-${Date.now()}`;
@@ -136,7 +238,7 @@ export class GoogleCalendarService implements CalendarService {
                     id: channelId,
                     type: 'web_hook',
                     address: notificationUrl,
-                    expiration: expiration.getTime().toString(),
+                    expiration: expiration.getTime(),
                 },
             });
 
@@ -157,17 +259,144 @@ export class GoogleCalendarService implements CalendarService {
             };
         } catch (error) {
             console.error('Failed to setup Google Calendar webhook:', error);
-            throw error;
+            throw this.normalizeGoogleError(error);
+        }
+    }
+
+    async removeWebhook(connectionId: string, webhookId: string): Promise<void> {
+        await this.ensureValidToken(connectionId);
+
+        try {
+            // Stop the channel
+            await this.calendar.channels.stop({
+                resource: {
+                    id: webhookId,
+                    resourceId: webhookId, // We need to get this from our database
+                },
+            });
+
+            // Remove from our database
+            await db.delete(googleWebhookChannels)
+                .where(eq(googleWebhookChannels.channelId, webhookId));
+
+        } catch (error) {
+            console.error('Failed to remove Google webhook:', error);
+            throw this.normalizeGoogleError(error);
+        }
+    }
+
+    async performFullSync(connectionId: string): Promise<void> {
+        await this.ensureValidToken(connectionId);
+
+        try {
+            // Clear existing sync token to force full sync
+            await db.update(calendarConnections)
+                .set({
+                    lastSyncToken: null,
+                    updatedAt: new Date()
+                })
+                .where(eq(calendarConnections.id, connectionId));
+
+            // Perform full sync with a reasonable time range (e.g., next 6 months)
+            const timeMin = new Date();
+            const timeMax = new Date();
+            timeMax.setMonth(timeMax.getMonth() + 6);
+
+            const result = await this.listEvents({
+                connectionId,
+                timeMin,
+                timeMax,
+                maxResults: 2500, // Google's maximum
+            });
+
+            // Store events in external events table
+            await this.storeExternalEvents(connectionId, result.events);
+
+            // Update sync token for future incremental syncs
+            if (result.nextSyncToken) {
+                await db.update(calendarConnections)
+                    .set({
+                        lastSyncToken: result.nextSyncToken,
+                        lastFullSyncAt: new Date(),
+                        updatedAt: new Date()
+                    })
+                    .where(eq(calendarConnections.id, connectionId));
+            }
+        } catch (error) {
+            console.error('Failed to perform full sync:', error);
+            throw this.normalizeGoogleError(error);
+        }
+    }
+
+    async performIncrementalSync(connectionId: string): Promise<void> {
+        await this.ensureValidToken(connectionId);
+        const connection = await this.getConnection(connectionId);
+
+        if (!connection.lastSyncToken) {
+            // No sync token available, perform full sync
+            return this.performFullSync(connectionId);
+        }
+
+        try {
+            const result = await this.listEvents({
+                connectionId,
+                syncToken: connection.lastSyncToken,
+            });
+
+            // Process incremental changes
+            await this.processIncrementalChanges(connectionId, result.events);
+
+            // Update sync token
+            if (result.nextSyncToken) {
+                await db.update(calendarConnections)
+                    .set({
+                        lastSyncToken: result.nextSyncToken,
+                        lastIncrementalSyncAt: new Date(),
+                        updatedAt: new Date()
+                    })
+                    .where(eq(calendarConnections.id, connectionId));
+            }
+        } catch (error) {
+            console.error('Failed to perform incremental sync:', error);
+            throw this.normalizeGoogleError(error);
         }
     }
 
     // Helper methods
-    private async setupAuth(connectionId: string): Promise<void> {
-        const connection = await this.getConnectionTokens(connectionId);
-        this.auth.setCredentials({
-            access_token: connection.accessToken,
-            refresh_token: connection.refreshToken,
-        });
+    private async handleConnectionError(connectionId: string, error: any): Promise<void> {
+        await db.update(calendarConnections)
+            .set({
+                consecutiveFailures: sql`${calendarConnections.consecutiveFailures} + 1`,
+                lastError: error.message,
+                updatedAt: new Date(),
+            })
+            .where(eq(calendarConnections.id, connectionId));
+    }
+
+    private async handleTokenRefreshError(connectionId: string, error: any): Promise<void> {
+        await db.update(calendarConnections)
+            .set({
+                consecutiveFailures: sql`${calendarConnections.consecutiveFailures} + 1`,
+                lastError: `Token refresh failed: ${error.message}`,
+                isActive: false, // Deactivate connection if token refresh fails
+                updatedAt: new Date(),
+            })
+            .where(eq(calendarConnections.id, connectionId));
+    }
+
+    private normalizeGoogleError(error: any): Error {
+        if (error.code === 401) {
+            return new Error('Authentication failed - please reconnect your calendar');
+        } else if (error.code === 403) {
+            return new Error('Calendar access denied - check permissions');
+        } else if (error.code === 404) {
+            return new Error('Calendar or event not found');
+        } else if (error.code === 429) {
+            return new Error('Rate limit exceeded - please try again later');
+        } else if (error.code >= 500) {
+            return new Error('Google Calendar service unavailable - please try again later');
+        }
+        return error;
     }
 
     private async getConnection(connectionId: string) {
@@ -183,24 +412,15 @@ export class GoogleCalendarService implements CalendarService {
         return result[0];
     }
 
-    private async getConnectionTokens(connectionId: string) {
-        const connection = await this.getConnection(connectionId);
-        return {
-            accessToken: connection.accessToken,
-            refreshToken: connection.refreshToken,
-        };
-    }
-
     private normalizeGoogleEvent(googleEvent: any): CalendarEvent {
-        // Convert Google Calendar event to universal format
         return {
             id: googleEvent.id,
             title: googleEvent.summary || 'Untitled',
             description: googleEvent.description,
             location: googleEvent.location,
 
-            startTime: new Date(googleEvent.start.dateTime || googleEvent.start.date),
-            endTime: new Date(googleEvent.end.dateTime || googleEvent.end.date),
+            startTime: new Date(googleEvent.start.dateTime || googleEvent.start.date + 'T00:00:00'),
+            endTime: new Date(googleEvent.end.dateTime || googleEvent.end.date + 'T23:59:59'),
             timeZone: googleEvent.start.timeZone || 'UTC',
             isAllDay: !!googleEvent.start.date,
 
@@ -215,7 +435,7 @@ export class GoogleCalendarService implements CalendarService {
             attendees: googleEvent.attendees?.map((attendee: any) => ({
                 email: attendee.email,
                 name: attendee.displayName,
-                responseStatus: attendee.responseStatus,
+                responseStatus: this.normalizeAttendeeStatus(attendee.responseStatus),
             })),
 
             recurrence: googleEvent.recurrence ? {
@@ -227,31 +447,47 @@ export class GoogleCalendarService implements CalendarService {
     }
 
     private convertToGoogleEvent(event: Partial<CalendarEvent>): any {
-        // Convert universal format to Google Calendar event
-        return {
+        const googleEvent: any = {
             summary: event.title,
             description: event.description,
             location: event.location,
+        };
 
-            start: {
-                dateTime: event.startTime?.toISOString(),
-                timeZone: event.timeZone,
-            },
-            end: {
-                dateTime: event.endTime?.toISOString(),
-                timeZone: event.timeZone,
-            },
+        if (event.startTime && event.endTime) {
+            if (event.isAllDay) {
+                googleEvent.start = { date: this.formatDateForAllDay(event.startTime) };
+                googleEvent.end = { date: this.formatDateForAllDay(event.endTime) };
+            } else {
+                googleEvent.start = {
+                    dateTime: event.startTime.toISOString(),
+                    timeZone: event.timeZone || 'UTC',
+                };
+                googleEvent.end = {
+                    dateTime: event.endTime.toISOString(),
+                    timeZone: event.timeZone || 'UTC',
+                };
+            }
+        }
 
-            status: event.status,
-            transparency: event.showAs === 'free' ? 'transparent' : 'opaque',
+        if (event.status) googleEvent.status = event.status;
+        if (event.showAs) googleEvent.transparency = event.showAs === 'free' ? 'transparent' : 'opaque';
 
-            attendees: event.attendees?.map(attendee => ({
+        if (event.attendees) {
+            googleEvent.attendees = event.attendees.map(attendee => ({
                 email: attendee.email,
                 displayName: attendee.name,
-            })),
+            }));
+        }
 
-            recurrence: event.recurrence ? [event.recurrence.rule] : undefined,
-        };
+        if (event.recurrence) {
+            googleEvent.recurrence = [event.recurrence.rule];
+        }
+
+        return googleEvent;
+    }
+
+    private formatDateForAllDay(date: Date): string {
+        return date.toISOString().split('T')[0];
     }
 
     private normalizeGoogleStatus(status: string): 'confirmed' | 'tentative' | 'cancelled' {
@@ -263,34 +499,77 @@ export class GoogleCalendarService implements CalendarService {
         }
     }
 
-    // Implement other CalendarService methods...
-    async updateEvent(connectionId: string, eventId: string, updates: Partial<CalendarEvent>): Promise<CalendarEvent> {
-        // Implementation for updating events
-        throw new Error('Method not implemented');
+    private normalizeAttendeeStatus(status: string): 'accepted' | 'declined' | 'tentative' | 'needsAction' {
+        switch (status) {
+            case 'accepted': return 'accepted';
+            case 'declined': return 'declined';
+            case 'tentative': return 'tentative';
+            case 'needsAction': return 'needsAction';
+            default: return 'needsAction';
+        }
     }
 
-    async deleteEvent(connectionId: string, eventId: string): Promise<void> {
-        // Implementation for deleting events
-        throw new Error('Method not implemented');
+    private async storeExternalEvents(connectionId: string, events: CalendarEvent[]): Promise<void> {
+        const externalEvents = events.map(event => ({
+            calendarConnectionId: connectionId,
+            providerEventId: event.id,
+            providerCalendarId: 'primary',
+            title: event.title,
+            description: event.description,
+            location: event.location,
+            startTime: event.startTime,
+            endTime: event.endTime,
+            timeZone: event.timeZone,
+            isAllDay: event.isAllDay,
+            status: event.status,
+            showAs: event.showAs,
+            organizerEmail: event.organizer?.email,
+            organizerName: event.organizer?.name,
+            attendeeEmails: event.attendees?.map(a => a.email) || [],
+            isRecurring: !!event.recurrence,
+            recurrenceRule: event.recurrence?.rule,
+            providerData: event.providerData,
+            lastSyncedAt: new Date(),
+            createdAt: new Date(),
+            updatedAt: new Date(),
+        }));
+
+        for (const eventData of externalEvents) {
+            await db.insert(externalCalendarEvents)
+                .values(eventData)
+                .onConflictDoUpdate({
+                    target: [externalCalendarEvents.calendarConnectionId, externalCalendarEvents.providerEventId],
+                    set: {
+                        title: eventData.title,
+                        description: eventData.description,
+                        startTime: eventData.startTime,
+                        endTime: eventData.endTime,
+                        status: eventData.status,
+                        showAs: eventData.showAs,
+                        updatedAt: new Date(),
+                        lastSyncedAt: new Date(),
+                    }
+                });
+        }
     }
 
-    async getFreeBusyInfo(): Promise<any> {
-        // Implementation for free/busy queries
-        throw new Error('Method not implemented');
-    }
+    private async processIncrementalChanges(connectionId: string, events: CalendarEvent[]): Promise<void> {
+        // For Google, events with status 'cancelled' should be deleted
+        const activeEvents = events.filter(event => event.status !== 'cancelled');
+        const cancelledEvents = events.filter(event => event.status === 'cancelled');
 
-    async removeWebhook(): Promise<void> {
-        // Implementation for removing webhooks
-        throw new Error('Method not implemented');
-    }
+        // Store active events
+        await this.storeExternalEvents(connectionId, activeEvents);
 
-    async performFullSync(): Promise<void> {
-        // Implementation for full sync
-        throw new Error('Method not implemented');
-    }
-
-    async performIncrementalSync(): Promise<void> {
-        // Implementation for incremental sync
-        throw new Error('Method not implemented');
+        // Delete cancelled events
+        for (const event of cancelledEvents) {
+            await db.delete(externalCalendarEvents)
+                .where(
+                    and(
+                        eq(externalCalendarEvents.providerEventId, event.id),
+                        eq(externalCalendarEvents.calendarConnectionId, connectionId)
+                    )
+                );
+        }
     }
 }

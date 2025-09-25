@@ -1,10 +1,9 @@
 ﻿// src/lib/calendar/providers/outlook/outlook-calendar-service.ts
 import type {CalendarService, CalendarEvent, OutlookCalendarConfig} from '../../types';
 import { Client } from '@microsoft/microsoft-graph-client';
-import type {AuthenticationProvider} from '@microsoft/microsoft-graph-client';
 import {db} from "@/db";
-import {calendarConnections, externalCalendarEvents, outlookSubscriptions} from "@/db/schema";
-import {eq} from "drizzle-orm";
+import {calendarConnections, externalCalendarEvents, outlookSubscriptions} from "@/db/schema/calendar-core";
+import {and, eq, sql} from "drizzle-orm";
 
 interface TokenResponse {
     access_token: string;
@@ -14,23 +13,27 @@ interface TokenResponse {
     scope?: string;
 }
 
-// Custom auth provider for Microsoft Graph
-class CustomAuthProvider implements AuthenticationProvider {
-    constructor(private accessToken: string) {}
-
-    async getAccessToken(): Promise<string> {
-        return this.accessToken;
-    }
-}
-
 export class OutlookCalendarService implements CalendarService {
-    private graphClient: Client | null = null;
-
     constructor(private config: OutlookCalendarConfig) {}
 
-    private async getGraphClient(connectionId: string): Promise<Client> {
+    private async ensureValidToken(connectionId: string): Promise<string> {
         const connection = await this.getConnection(connectionId);
-        const authProvider = new CustomAuthProvider(connection.accessToken);
+
+        // Check if token is expired or about to expire (within 5 minutes)
+        if (connection.tokenExpiresAt && new Date(connection.tokenExpiresAt) < new Date(Date.now() + 5 * 60 * 1000)) {
+            await this.refreshTokens(connectionId);
+            // Get the updated connection
+            const updatedConnection = await this.getConnection(connectionId);
+            return updatedConnection.accessToken;
+        }
+
+        return connection.accessToken;
+    }
+
+    private async getGraphClient(accessToken: string): Promise<Client> {
+        const authProvider = {
+            getAccessToken: async () => accessToken
+        };
 
         return Client.initWithMiddleware({
             authProvider: authProvider
@@ -39,22 +42,23 @@ export class OutlookCalendarService implements CalendarService {
 
     async validateConnection(connectionId: string): Promise<boolean> {
         try {
-            const graphClient = await this.getGraphClient(connectionId);
+            const accessToken = await this.ensureValidToken(connectionId);
+            const graphClient = await this.getGraphClient(accessToken);
 
             // Test with a simple API call
-            await graphClient.api('/me/calendars').top(1).get();
+            await graphClient.api('/me').get();
             return true;
         } catch (error) {
             console.error('Outlook Calendar connection validation failed:', error);
+            await this.handleConnectionError(connectionId, error);
             return false;
         }
     }
 
     async refreshTokens(connectionId: string): Promise<void> {
-        const connection = await this.getConnectionTokens(connectionId);
+        const connection = await this.getConnection(connectionId);
 
         try {
-            // Microsoft Graph token refresh
             const tokenEndpoint = this.config.tenantId
                 ? `https://login.microsoftonline.com/${this.config.tenantId}/oauth2/v2.0/token`
                 : 'https://login.microsoftonline.com/common/oauth2/v2.0/token';
@@ -74,7 +78,8 @@ export class OutlookCalendarService implements CalendarService {
             });
 
             if (!response.ok) {
-                throw new Error(`Token refresh failed: ${response.statusText}`);
+                const errorText = await response.text();
+                throw new Error(`Token refresh failed: ${response.status} ${response.statusText} - ${errorText}`);
             }
 
             const tokens: TokenResponse = await response.json();
@@ -85,12 +90,15 @@ export class OutlookCalendarService implements CalendarService {
                     accessToken: tokens.access_token,
                     refreshToken: tokens.refresh_token || connection.refreshToken,
                     tokenExpiresAt: new Date(Date.now() + (tokens.expires_in * 1000)),
+                    consecutiveFailures: 0,
+                    lastError: null,
                     updatedAt: new Date(),
                 })
                 .where(eq(calendarConnections.id, connectionId));
 
         } catch (error) {
             console.error('Outlook token refresh failed:', error);
+            await this.handleTokenRefreshError(connectionId, error);
             throw new Error('Failed to refresh Outlook Calendar tokens');
         }
     }
@@ -106,55 +114,62 @@ export class OutlookCalendarService implements CalendarService {
         nextSyncToken?: string;
         nextPageToken?: string;
     }> {
-        const graphClient = await this.getGraphClient(params.connectionId);
+        const accessToken = await this.ensureValidToken(params.connectionId);
+        const graphClient = await this.getGraphClient(accessToken);
         const connection = await this.getConnection(params.connectionId);
 
         try {
             let apiCall;
+            let isDeltaQuery = false;
 
-            if (params.syncToken) {
+            if (params.syncToken && params.syncToken.includes('delta')) {
                 // Use delta link for incremental sync
-                // For Outlook, syncToken should be the deltaLink URL
+                isDeltaQuery = true;
                 apiCall = graphClient.api(params.syncToken);
             } else {
-                // Build fresh query for delta sync
-                apiCall = graphClient.api(`/me/calendars/${connection.calendarId}/events/delta`);
+                // Build fresh query
+                apiCall = graphClient.api(`/me/calendars/${connection.calendarId}/events`);
 
-                // Add filters for initial delta query
-                const filters = [];
-                if (params.timeMin) {
-                    filters.push(`start/dateTime ge '${params.timeMin.toISOString()}'`);
-                }
-                if (params.timeMax) {
-                    filters.push(`end/dateTime le '${params.timeMax.toISOString()}'`);
-                }
-
-                if (filters.length > 0) {
-                    apiCall = apiCall.filter(filters.join(' and '));
+                // Add filters for time range
+                if (params.timeMin || params.timeMax) {
+                    const filters = [];
+                    if (params.timeMin) {
+                        filters.push(`start/dateTime ge '${params.timeMin.toISOString()}'`);
+                    }
+                    if (params.timeMax) {
+                        filters.push(`end/dateTime le '${params.timeMax.toISOString()}'`);
+                    }
+                    if (filters.length > 0) {
+                        apiCall = apiCall.filter(filters.join(' and '));
+                    }
                 }
 
                 if (params.maxResults) {
                     apiCall = apiCall.top(params.maxResults);
                 }
+
+                // Order by start time
+                apiCall = apiCall.orderby('start/dateTime');
             }
 
             const response = await apiCall.get();
 
-            const events = response.value?.map(this.normalizeOutlookEvent) || [];
+            const events = response.value?.map((event: any) => this.normalizeOutlookEvent(event)) || [];
 
             return {
                 events,
-                nextSyncToken: response['@odata.deltaLink'], // Outlook's delta link for next sync
+                nextSyncToken: isDeltaQuery ? response['@odata.deltaLink'] : undefined,
                 nextPageToken: response['@odata.nextLink'],
             };
         } catch (error) {
             console.error('Failed to list Outlook Calendar events:', error);
-            throw error;
+            throw this.normalizeOutlookError(error);
         }
     }
 
     async createEvent(connectionId: string, event: Partial<CalendarEvent>): Promise<CalendarEvent> {
-        const graphClient = await this.getGraphClient(connectionId);
+        const accessToken = await this.ensureValidToken(connectionId);
+        const graphClient = await this.getGraphClient(accessToken);
         const connection = await this.getConnection(connectionId);
 
         const outlookEvent = this.convertToOutlookEvent(event);
@@ -167,12 +182,13 @@ export class OutlookCalendarService implements CalendarService {
             return this.normalizeOutlookEvent(response);
         } catch (error) {
             console.error('Failed to create Outlook Calendar event:', error);
-            throw error;
+            throw this.normalizeOutlookError(error);
         }
     }
 
     async updateEvent(connectionId: string, eventId: string, updates: Partial<CalendarEvent>): Promise<CalendarEvent> {
-        const graphClient = await this.getGraphClient(connectionId);
+        const accessToken = await this.ensureValidToken(connectionId);
+        const graphClient = await this.getGraphClient(accessToken);
         const connection = await this.getConnection(connectionId);
 
         const outlookUpdates = this.convertToOutlookEvent(updates);
@@ -185,12 +201,13 @@ export class OutlookCalendarService implements CalendarService {
             return this.normalizeOutlookEvent(response);
         } catch (error) {
             console.error('Failed to update Outlook Calendar event:', error);
-            throw error;
+            throw this.normalizeOutlookError(error);
         }
     }
 
     async deleteEvent(connectionId: string, eventId: string): Promise<void> {
-        const graphClient = await this.getGraphClient(connectionId);
+        const accessToken = await this.ensureValidToken(connectionId);
+        const graphClient = await this.getGraphClient(accessToken);
         const connection = await this.getConnection(connectionId);
 
         try {
@@ -199,7 +216,7 @@ export class OutlookCalendarService implements CalendarService {
                 .delete();
         } catch (error) {
             console.error('Failed to delete Outlook Calendar event:', error);
-            throw error;
+            throw this.normalizeOutlookError(error);
         }
     }
 
@@ -213,7 +230,8 @@ export class OutlookCalendarService implements CalendarService {
         busy: Array<{ start: Date; end: Date }>;
         errors: Array<{ domain: string; reason: string }>;
     }[]> {
-        const graphClient = await this.getGraphClient(params.connectionId);
+        const accessToken = await this.ensureValidToken(params.connectionId);
+        const graphClient = await this.getGraphClient(accessToken);
         const connection = await this.getConnection(params.connectionId);
 
         const calendarsToCheck = params.calendars || [connection.calendarId];
@@ -234,19 +252,15 @@ export class OutlookCalendarService implements CalendarService {
 
             return response.value.map((schedule: any) => ({
                 calendar: schedule.scheduleId,
-                busy: schedule.busyViewInterval.map((interval: string, index: number) => {
-                    if (interval !== '0') { // '0' means free, other values indicate busy
-                        const startTime = new Date(params.timeMin.getTime() + (index * 60 * 60 * 1000));
-                        const endTime = new Date(startTime.getTime() + (60 * 60 * 1000));
-                        return { start: startTime, end: endTime };
-                    }
-                    return null;
-                }).filter(Boolean),
-                errors: schedule.errors || []
+                busy: schedule.scheduleItems?.map((item: any) => ({
+                    start: new Date(item.start.dateTime),
+                    end: new Date(item.end.dateTime),
+                })) || [],
+                errors: schedule.error ? [schedule.error] : []
             }));
         } catch (error) {
             console.error('Failed to get Outlook free/busy info:', error);
-            throw error;
+            throw this.normalizeOutlookError(error);
         }
     }
 
@@ -254,11 +268,12 @@ export class OutlookCalendarService implements CalendarService {
         webhookId: string;
         expirationTime: Date;
     }> {
-        const graphClient = await this.getGraphClient(connectionId);
+        const accessToken = await this.ensureValidToken(connectionId);
+        const graphClient = await this.getGraphClient(accessToken);
         const connection = await this.getConnection(connectionId);
 
         const subscriptionId = `subscription-${connectionId}-${Date.now()}`;
-        const expirationTime = new Date(Date.now() + (3 * 24 * 60 * 60 * 1000)); // 3 days max for Outlook
+        const expirationTime = new Date(Date.now() + (2 * 24 * 60 * 60 * 1000)); // 2 days for Outlook
 
         try {
             const subscription = await graphClient.api('/subscriptions').post({
@@ -266,10 +281,10 @@ export class OutlookCalendarService implements CalendarService {
                 notificationUrl: notificationUrl,
                 resource: `/me/calendars/${connection.calendarId}/events`,
                 expirationDateTime: expirationTime.toISOString(),
-                clientState: subscriptionId, // For verification
+                clientState: subscriptionId,
             });
 
-            // Store subscription info in Outlook-specific table
+            // Store subscription info
             await db.insert(outlookSubscriptions).values({
                 id: subscriptionId,
                 calendarConnectionId: connectionId,
@@ -279,6 +294,7 @@ export class OutlookCalendarService implements CalendarService {
                 notificationUrl: notificationUrl,
                 clientState: subscriptionId,
                 expirationDateTime: expirationTime,
+                createdAt: new Date(),
             });
 
             return {
@@ -287,12 +303,13 @@ export class OutlookCalendarService implements CalendarService {
             };
         } catch (error) {
             console.error('Failed to setup Outlook Calendar webhook:', error);
-            throw error;
+            throw this.normalizeOutlookError(error);
         }
     }
 
     async removeWebhook(connectionId: string, webhookId: string): Promise<void> {
-        const graphClient = await this.getGraphClient(connectionId);
+        const accessToken = await this.ensureValidToken(connectionId);
+        const graphClient = await this.getGraphClient(accessToken);
 
         try {
             await graphClient.api(`/subscriptions/${webhookId}`).delete();
@@ -303,67 +320,131 @@ export class OutlookCalendarService implements CalendarService {
 
         } catch (error) {
             console.error('Failed to remove Outlook webhook:', error);
-            throw error;
+            throw this.normalizeOutlookError(error);
         }
     }
 
     async performFullSync(connectionId: string): Promise<void> {
-        // Clear existing sync token to force full sync
-        await db.update(calendarConnections)
-            .set({
-                lastSyncToken: null,
-                updatedAt: new Date()
-            })
-            .where(eq(calendarConnections.id, connectionId));
+        const accessToken = await this.ensureValidToken(connectionId);
 
-        // Perform full sync
-        const result = await this.listEvents({
-            connectionId,
-            maxResults: 1000, // Outlook's default limit
-        });
-
-        // Store events in external events table
-        await this.storeExternalEvents(connectionId, result.events);
-
-        // Update sync token for future incremental syncs
-        if (result.nextSyncToken) {
+        try {
+            // Clear existing sync token to force full sync
             await db.update(calendarConnections)
                 .set({
-                    lastSyncToken: result.nextSyncToken,
+                    lastSyncToken: null,
                     updatedAt: new Date()
                 })
                 .where(eq(calendarConnections.id, connectionId));
+
+            // Get delta token for full sync
+            const graphClient = await this.getGraphClient(accessToken);
+            const connection = await this.getConnection(connectionId);
+
+            // Get initial delta token
+            const deltaResponse = await graphClient
+                .api(`/me/calendars/${connection.calendarId}/events/delta`)
+                .top(100)
+                .get();
+
+            const events = deltaResponse.value?.map((event: any) => this.normalizeOutlookEvent(event)) || [];
+
+            // Store events
+            await this.storeExternalEvents(connectionId, events);
+
+            // Update sync token
+            if (deltaResponse['@odata.deltaLink']) {
+                await db.update(calendarConnections)
+                    .set({
+                        lastSyncToken: deltaResponse['@odata.deltaLink'],
+                        lastFullSyncAt: new Date(),
+                        updatedAt: new Date()
+                    })
+                    .where(eq(calendarConnections.id, connectionId));
+            }
+        } catch (error) {
+            console.error('Failed to perform full sync:', error);
+            throw this.normalizeOutlookError(error);
         }
     }
 
     async performIncrementalSync(connectionId: string): Promise<void> {
+        const accessToken = await this.ensureValidToken(connectionId);
         const connection = await this.getConnection(connectionId);
 
         if (!connection.lastSyncToken) {
-            // No sync token available, perform full sync
             return this.performFullSync(connectionId);
         }
 
-        const result = await this.listEvents({
-            connectionId,
-            syncToken: connection.lastSyncToken,
-        });
+        try {
+            const graphClient = await this.getGraphClient(accessToken);
 
-        // Process incremental changes
-        await this.processIncrementalChanges(connectionId, result.events);
+            const deltaResponse = await graphClient
+                .api(connection.lastSyncToken)
+                .get();
 
-        // Update sync token
-        if (result.nextSyncToken) {
-            await db.update(calendarConnections)
-                .set({
-                    lastSyncToken: result.nextSyncToken,
-                    updatedAt: new Date()
-                })
-                .where(eq(calendarConnections.id, connectionId));
+            const events = deltaResponse.value?.map((event: any) => this.normalizeOutlookEvent(event)) || [];
+
+            // Process changes (new, updated, deleted events)
+            await this.processDeltaChanges(connectionId, events);
+
+            // Update sync token
+            if (deltaResponse['@odata.deltaLink']) {
+                await db.update(calendarConnections)
+                    .set({
+                        lastSyncToken: deltaResponse['@odata.deltaLink'],
+                        lastIncrementalSyncAt: new Date(),
+                        updatedAt: new Date()
+                    })
+                    .where(eq(calendarConnections.id, connectionId));
+            }
+        } catch (error: any) {
+            if (error.statusCode === 410) { // Delta token expired
+                // Perform full sync
+                await this.performFullSync(connectionId);
+            } else {
+                console.error('Failed to perform incremental sync:', error);
+                throw this.normalizeOutlookError(error);
+            }
         }
     }
 
     // Helper methods
+    private async handleConnectionError(connectionId: string, error: any): Promise<void> {
+        await db.update(calendarConnections)
+            .set({
+                consecutiveFailures: sql`${calendarConnections.consecutiveFailures} + 1`,
+                lastError: error.message,
+                updatedAt: new Date(),
+            })
+            .where(eq(calendarConnections.id, connectionId));
+    }
+
+    private async handleTokenRefreshError(connectionId: string, error: any): Promise<void> {
+        await db.update(calendarConnections)
+            .set({
+                consecutiveFailures: sql`${calendarConnections.consecutiveFailures} + 1`,
+                lastError: `Token refresh failed: ${error.message}`,
+                isActive: false,
+                updatedAt: new Date(),
+            })
+            .where(eq(calendarConnections.id, connectionId));
+    }
+
+    private normalizeOutlookError(error: any): Error {
+        if (error.statusCode === 401) {
+            return new Error('Authentication failed - please reconnect your calendar');
+        } else if (error.statusCode === 403) {
+            return new Error('Calendar access denied - check permissions');
+        } else if (error.statusCode === 404) {
+            return new Error('Calendar or event not found');
+        } else if (error.statusCode === 429) {
+            return new Error('Rate limit exceeded - please try again later');
+        } else if (error.statusCode >= 500) {
+            return new Error('Outlook Calendar service unavailable - please try again later');
+        }
+        return error;
+    }
+
     private async getConnection(connectionId: string) {
         const result = await db.select()
             .from(calendarConnections)
@@ -377,16 +458,7 @@ export class OutlookCalendarService implements CalendarService {
         return result[0];
     }
 
-    private async getConnectionTokens(connectionId: string) {
-        const connection = await this.getConnection(connectionId);
-        return {
-            accessToken: connection.accessToken,
-            refreshToken: connection.refreshToken,
-        };
-    }
-
     private normalizeOutlookEvent(outlookEvent: any): CalendarEvent {
-        // Convert Outlook event to universal format
         return {
             id: outlookEvent.id,
             title: outlookEvent.subject || 'Untitled',
@@ -398,7 +470,7 @@ export class OutlookCalendarService implements CalendarService {
             timeZone: outlookEvent.start.timeZone || 'UTC',
             isAllDay: outlookEvent.isAllDay || false,
 
-            status: this.normalizeOutlookStatus(outlookEvent.responseStatus?.response),
+            status: this.normalizeOutlookStatus(outlookEvent.responseStatus),
             showAs: this.normalizeOutlookShowAs(outlookEvent.showAs),
 
             organizer: outlookEvent.organizer ? {
@@ -409,7 +481,7 @@ export class OutlookCalendarService implements CalendarService {
             attendees: outlookEvent.attendees?.map((attendee: any) => ({
                 email: attendee.emailAddress.address,
                 name: attendee.emailAddress.name,
-                responseStatus: this.normalizeResponseStatus(attendee.status?.response),
+                responseStatus: this.normalizeAttendeeStatus(attendee.status),
             })),
 
             recurrence: outlookEvent.recurrence ? {
@@ -421,44 +493,54 @@ export class OutlookCalendarService implements CalendarService {
     }
 
     private convertToOutlookEvent(event: Partial<CalendarEvent>): any {
-        // Convert universal format to Outlook event
-        return {
+        const outlookEvent: any = {
             subject: event.title,
             body: event.description ? {
                 contentType: 'text',
                 content: event.description
             } : undefined,
-            location: event.location ? {
+        };
+
+        if (event.location) {
+            outlookEvent.location = {
                 displayName: event.location
-            } : undefined,
+            };
+        }
 
-            start: {
-                dateTime: event.startTime?.toISOString(),
+        if (event.startTime && event.endTime) {
+            outlookEvent.start = {
+                dateTime: event.startTime.toISOString(),
                 timeZone: event.timeZone || 'UTC',
-            },
-            end: {
-                dateTime: event.endTime?.toISOString(),
+            };
+            outlookEvent.end = {
+                dateTime: event.endTime.toISOString(),
                 timeZone: event.timeZone || 'UTC',
-            },
+            };
+            outlookEvent.isAllDay = event.isAllDay || false;
+        }
 
-            isAllDay: event.isAllDay,
-            showAs: this.convertShowAsToOutlook(event.showAs),
+        if (event.showAs) {
+            outlookEvent.showAs = this.convertShowAsToOutlook(event.showAs);
+        }
 
-            attendees: event.attendees?.map(attendee => ({
+        if (event.attendees) {
+            outlookEvent.attendees = event.attendees.map(attendee => ({
                 emailAddress: {
                     address: attendee.email,
                     name: attendee.name,
                 },
                 type: 'required',
-            })),
+            }));
+        }
 
-            recurrence: event.recurrence ?
-                this.convertRRuleToOutlookRecurrence(event.recurrence.rule) : undefined,
-        };
+        return outlookEvent;
     }
 
-    private normalizeOutlookStatus(status: string): 'confirmed' | 'tentative' | 'cancelled' {
-        switch (status?.toLowerCase()) {
+    private normalizeOutlookStatus(status: any): 'confirmed' | 'tentative' | 'cancelled' {
+        if (!status) return 'confirmed';
+
+        const statusStr = typeof status === 'string' ? status : status.response;
+        switch (statusStr?.toLowerCase()) {
             case 'accepted': return 'confirmed';
             case 'tentativelyaccepted': return 'tentative';
             case 'declined': return 'cancelled';
@@ -476,8 +558,11 @@ export class OutlookCalendarService implements CalendarService {
         }
     }
 
-    private normalizeResponseStatus(status: string): 'accepted' | 'declined' | 'tentative' | 'needsAction' {
-        switch (status?.toLowerCase()) {
+    private normalizeAttendeeStatus(status: any): 'accepted' | 'declined' | 'tentative' | 'needsAction' {
+        if (!status) return 'needsAction';
+
+        const statusStr = typeof status === 'string' ? status : status.response;
+        switch (statusStr?.toLowerCase()) {
             case 'accepted': return 'accepted';
             case 'declined': return 'declined';
             case 'tentativelyaccepted': return 'tentative';
@@ -497,96 +582,99 @@ export class OutlookCalendarService implements CalendarService {
     }
 
     private convertOutlookRecurrenceToRRule(recurrence: any): string {
-        // Convert Outlook recurrence pattern to RRULE format
-        // This is a simplified conversion - full implementation would be more complex
+        // Simplified conversion - in production, you'd want a more complete implementation
         const pattern = recurrence.pattern;
+        const range = recurrence.range;
+
         let rrule = 'RRULE:';
 
         switch (pattern.type) {
             case 'daily':
-                rrule += `FREQ=DAILY;INTERVAL=${pattern.interval}`;
+                rrule += `FREQ=DAILY;INTERVAL=${pattern.interval || 1}`;
                 break;
             case 'weekly':
-                rrule += `FREQ=WEEKLY;INTERVAL=${pattern.interval}`;
+                rrule += `FREQ=WEEKLY;INTERVAL=${pattern.interval || 1}`;
                 if (pattern.daysOfWeek?.length > 0) {
-                    const days = pattern.daysOfWeek.map(this.convertOutlookDayToRRule).join(',');
-                    rrule += `;BYDAY=${days}`;
+                    rrule += `;BYDAY=${pattern.daysOfWeek.join(',')}`;
                 }
                 break;
             case 'absoluteMonthly':
-                rrule += `FREQ=MONTHLY;INTERVAL=${pattern.interval};BYMONTHDAY=${pattern.dayOfMonth}`;
+                rrule += `FREQ=MONTHLY;INTERVAL=${pattern.interval || 1};BYMONTHDAY=${pattern.dayOfMonth}`;
                 break;
-            case 'relativeMonthly':
-                rrule += `FREQ=MONTHLY;INTERVAL=${pattern.interval}`;
-                break;
-            case 'absoluteYearly':
-                rrule += `FREQ=YEARLY;INTERVAL=${pattern.interval};BYMONTH=${pattern.month};BYMONTHDAY=${pattern.dayOfMonth}`;
-                break;
+            default:
+                return 'RRULE:FREQ=DAILY;INTERVAL=1';
+        }
+
+        if (range.type === 'endDate') {
+            rrule += `;UNTIL=${range.endDate}`;
+        } else if (range.type === 'numbered') {
+            rrule += `;COUNT=${range.numberOfOccurrences}`;
         }
 
         return rrule;
     }
 
-    private convertRRuleToOutlookRecurrence(rrule: string): any {
-        // Convert RRULE to Outlook recurrence pattern
-        // This is a simplified conversion - full implementation would be more complex
-        // You would parse the RRULE and convert to Outlook's format
-        throw new Error('RRULE to Outlook recurrence conversion not implemented');
-    }
-
-    private convertOutlookDayToRRule(day: string): string {
-        const dayMap: { [key: string]: string } = {
-            'sunday': 'SU',
-            'monday': 'MO',
-            'tuesday': 'TU',
-            'wednesday': 'WE',
-            'thursday': 'TH',
-            'friday': 'FR',
-            'saturday': 'SA'
-        };
-        return dayMap[day.toLowerCase()] || day;
-    }
-
     private async storeExternalEvents(connectionId: string, events: CalendarEvent[]): Promise<void> {
-        // Implementation for storing events in externalCalendarEvents table
-        for (const event of events) {
+        const externalEvents = events.map(event => ({
+            calendarConnectionId: connectionId,
+            providerEventId: event.id,
+            providerCalendarId: 'primary',
+            title: event.title,
+            description: event.description,
+            location: event.location,
+            startTime: event.startTime,
+            endTime: event.endTime,
+            timeZone: event.timeZone,
+            isAllDay: event.isAllDay,
+            status: event.status,
+            showAs: event.showAs,
+            organizerEmail: event.organizer?.email,
+            organizerName: event.organizer?.name,
+            attendeeEmails: event.attendees?.map(a => a.email) || [],
+            isRecurring: !!event.recurrence,
+            recurrenceRule: event.recurrence?.rule,
+            providerData: event.providerData,
+            lastSyncedAt: new Date(),
+            createdAt: new Date(),
+            updatedAt: new Date(),
+        }));
+
+        for (const eventData of externalEvents) {
             await db.insert(externalCalendarEvents)
-                .values({
-                    calendarConnectionId: connectionId,
-                    providerEventId: event.id,
-                    providerCalendarId: 'primary', // or get from connection
-                    title: event.title,
-                    description: event.description,
-                    location: event.location,
-                    startTime: event.startTime,
-                    endTime: event.endTime,
-                    timeZone: event.timeZone,
-                    isAllDay: event.isAllDay,
-                    status: event.status,
-                    showAs: event.showAs,
-                    organizerEmail: event.organizer?.email,
-                    organizerName: event.organizer?.name,
-                    attendeeEmails: event.attendees?.map(a => a.email) || [],
-                    isRecurring: !!event.recurrence,
-                    recurrenceRule: event.recurrence?.rule,
-                    providerData: event.providerData,
-                    lastSyncedAt: new Date(),
-                })
+                .values(eventData)
                 .onConflictDoUpdate({
                     target: [externalCalendarEvents.calendarConnectionId, externalCalendarEvents.providerEventId],
                     set: {
-                        title: event.title,
-                        description: event.description,
-                        startTime: event.startTime,
-                        endTime: event.endTime,
+                        title: eventData.title,
+                        description: eventData.description,
+                        startTime: eventData.startTime,
+                        endTime: eventData.endTime,
+                        status: eventData.status,
+                        showAs: eventData.showAs,
                         updatedAt: new Date(),
+                        lastSyncedAt: new Date(),
                     }
                 });
         }
     }
 
-    private async processIncrementalChanges(connectionId: string, events: CalendarEvent[]): Promise<void> {
-        // Similar to storeExternalEvents but handles deletions differently
-        await this.storeExternalEvents(connectionId, events);
+    private async processDeltaChanges(connectionId: string, events: any[]): Promise<void> {
+        for (const event of events) {
+            const normalizedEvent = this.normalizeOutlookEvent(event);
+
+            if (event['@removed']) {
+                // Event was deleted
+                await db.delete(externalCalendarEvents)
+                    .where(
+                        and(
+                            eq(externalCalendarEvents.providerEventId, event.id),
+                            eq(externalCalendarEvents.calendarConnectionId, connectionId)
+                        )
+                    );
+            } else {
+                // Event was created or updated
+                await this.storeExternalEvents(connectionId, [normalizedEvent]);
+            }
+        }
     }
 }

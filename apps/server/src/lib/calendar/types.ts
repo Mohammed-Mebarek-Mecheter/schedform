@@ -38,6 +38,28 @@ export const CalendarEventSchema = z.object({
 
 export type CalendarEvent = z.infer<typeof CalendarEventSchema>;
 
+// Sync result type
+export type CalendarSyncResult = {
+    events: CalendarEvent[];
+    nextSyncToken?: string;
+    nextPageToken?: string;
+    hasMore?: boolean;
+};
+
+// Free/busy result type
+export type FreeBusyResult = {
+    calendar: string;
+    busy: Array<{ start: Date; end: Date }>;
+    errors: Array<{ domain: string; reason: string }>;
+};
+
+// Webhook result type
+export type WebhookResult = {
+    webhookId: string;
+    expirationTime: Date;
+    resourceId?: string;
+};
+
 // Universal service interface
 export interface CalendarService {
     // Connection management
@@ -106,3 +128,7 @@ export type CalendarProviderConfig =
     | { provider: 'google'; config: GoogleCalendarConfig }
     | { provider: 'outlook'; config: OutlookCalendarConfig };
 
+// Sync status types
+export type SyncStatus = 'running' | 'completed' | 'failed' | 'partial';
+export type SyncDirection = 'inbound' | 'outbound' | 'bidirectional';
+export type SyncType = 'full' | 'incremental' | 'webhook' | 'manual';

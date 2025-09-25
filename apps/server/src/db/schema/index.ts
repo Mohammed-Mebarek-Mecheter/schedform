@@ -26,3 +26,6 @@ export * from "./localization";
 
 // Calendar
 export * from "./calendar-core";
+
+// Video Conferencing
+export * from "./video-conference-core";

@@ -17,6 +17,7 @@ import { users, organizations, teams } from "@/db/schema/auth";
 import { formResponses, forms } from "@/db/schema/forms";
 import { eventTypeTranslations, supportedLanguages } from "@/db/schema/localization";
 import { calendarConnections } from "./calendar-core";
+import {videoMeetings} from "@/db/schema/video-conference-core";
 
 /* ============================
    Enums (Postgres pg_enum types)
@@ -323,9 +324,7 @@ export const bookings = pgTable(
     "bookings",
     {
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        eventTypeId: text("event_type_id")
-            .notNull()
-            .references(() => eventTypes.id, { onDelete: "restrict" }),
+        eventTypeId: text("event_type_id").notNull(),
         formResponseId: text("form_response_id").references(() => formResponses.id, {
             onDelete: "set null",
         }),
@@ -347,12 +346,10 @@ export const bookings = pgTable(
         guestCompany: text("guest_company"),
         guestTitle: text("guest_title"),
 
+        videoMeetingId: text("video_meeting_id"), // FK in relations
+
         meetingType: meetingTypeEnum("meeting_type").notNull(),
         location: text("location"),
-        meetingUrl: text("meeting_url"),
-        meetingId: text("meeting_id"),
-        meetingPassword: text("meeting_password"),
-        dialInNumber: text("dial_in_number"),
 
         status: bookingStatusEnum("status").notNull().default("draft"),
         statusHistory: jsonb("status_history"),
@@ -378,16 +375,12 @@ export const bookings = pgTable(
         emailVerifiedAt: timestamp("email_verified_at", { mode: "date" }),
 
         externalCalendarEventId: text("external_calendar_event_id"),
-        calendarEventCreated: boolean("calendar_event_created")
-            .notNull()
-            .default(false),
+        calendarEventCreated: boolean("calendar_event_created").notNull().default(false),
         calendarEventError: text("calendar_event_error"),
 
         noShowReason: noShowReasonEnum("no_show_reason"),
         noShowDetectedAt: timestamp("no_show_detected_at", { mode: "date" }),
-        noShowFollowUpSent: boolean("no_show_follow_up_sent")
-            .notNull()
-            .default(false),
+        noShowFollowUpSent: boolean("no_show_follow_up_sent").notNull().default(false),
 
         price: real("price"),
         currency: text("currency"),
@@ -404,22 +397,23 @@ export const bookings = pgTable(
         bookingDuration: integer("booking_duration"),
         conversionSource: text("conversion_source"),
 
-        detectedLanguage: text("detected_language").references(() => supportedLanguages.code, { onDelete: "set null" }),
-        preferredLanguage: text("preferred_language").references(() => supportedLanguages.code, { onDelete: "set null" }),
+        detectedLanguage: text("detected_language").references(() => supportedLanguages.code, {
+            onDelete: "set null",
+        }),
+        preferredLanguage: text("preferred_language").references(() => supportedLanguages.code, {
+            onDelete: "set null",
+        }),
 
-        // Timezone and locale preferences
         detectedTimezone: text("detected_timezone"),
         preferredDateFormat: text("preferred_date_format"),
         preferredTimeFormat: text("preferred_time_format"),
 
-        // Localized meeting details
-        localizedMeetingDetails: jsonb("localized_meeting_details"), // Meeting info in guest's language
+        localizedMeetingDetails: jsonb("localized_meeting_details"),
         localizedPreparationTips: jsonb("localized_preparation_tips"),
 
-        // Organization and team context
         assignedUserId: text("assigned_user_id").references(() => users.id, { onDelete: "set null" }),
-        permissions: jsonb("permissions"), // Booking-specific permissions
-        metadata: jsonb("metadata"), // Additional booking metadata
+        permissions: jsonb("permissions"),
+        metadata: jsonb("metadata"),
 
         createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
         updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
@@ -438,10 +432,11 @@ export const bookings = pgTable(
         idxGuestEmail: index("bookings_guest_email_idx").on(t.guestEmail),
         idxStartTime: index("bookings_start_time_idx").on(t.startTime),
         idxCreated: index("bookings_created_idx").on(t.createdAt),
-        idxAssignedUser: index("bookings_assigned_user_idx").on(t.assignedUserId).where(sql`${t.assignedUserId} IS NOT NULL`),
+        idxAssignedUser: index("bookings_assigned_user_idx")
+            .on(t.assignedUserId)
+            .where(sql`${t.assignedUserId} IS NOT NULL`),
 
         chkGuestEmail: sql`CHECK (${t.guestEmail} ~ '^[^@]+@[^@]+\\.[^@]+')`,
-        chkMeetingUrl: sql`CHECK (${t.meetingUrl} IS NULL OR ${t.meetingUrl} ~ '^https?://')`,
         chkRescheduleCount: sql`CHECK (${t.rescheduleCount} >= 0)`,
         chkQualificationScore: sql`CHECK (${t.qualificationScore} IS NULL OR (${t.qualificationScore} >= 0 AND ${t.qualificationScore} <= 100))`,
         chkPriorityScore: sql`CHECK (${t.priorityScore} IS NULL OR (${t.priorityScore} >= 1 AND ${t.priorityScore} <= 100))`,
@@ -910,6 +905,10 @@ export const bookingsRelations = relations(bookings, ({ one, many }) => ({
     preferredLanguageRef: one(supportedLanguages, {
         fields: [bookings.preferredLanguage],
         references: [supportedLanguages.code],
+    }),
+    videoMeeting: one(videoMeetings, {
+        fields: [bookings.videoMeetingId],
+        references: [videoMeetings.id],
     }),
 }));
 

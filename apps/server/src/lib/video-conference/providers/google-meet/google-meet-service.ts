@@ -1,14 +1,15 @@
 // src/lib/video-conference/providers/google-meet/google-meet-service.ts
 import type { VideoConferenceService, VideoMeeting, MeetingParticipant, MeetingRecording, MeetingTranscript, GoogleMeetConfig } from '../../types';
-import { google } from 'googleapis';
+import { google, meet_v2 } from 'googleapis';
 import { OAuth2Client } from 'google-auth-library';
 import { db } from '@/db';
 import { videoConferenceConnections, googleMeetConfigs } from '@/db/schema/video-conference-core';
-import {and, eq, sql} from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
+import { VideoConferenceError, VideoConferenceErrorHandler } from '../../error-handler';
 
 export class GoogleMeetVideoService implements VideoConferenceService {
     private auth: OAuth2Client;
-    private meet: any;
+    private meet: meet_v2.Meet;
 
     constructor(private config: GoogleMeetConfig) {
         this.auth = new google.auth.OAuth2(
@@ -37,13 +38,11 @@ export class GoogleMeetVideoService implements VideoConferenceService {
                 refresh_token: connection.refreshToken,
             });
 
-            // Test with spaces API
-            await this.meet.spaces.list();
             return true;
         } catch (error) {
             console.error('Google Meet connection validation failed:', error);
             await this.handleConnectionError(connectionId, error);
-            return false;
+            throw VideoConferenceErrorHandler.handleGoogleMeetError(error);
         }
     }
 
@@ -71,7 +70,7 @@ export class GoogleMeetVideoService implements VideoConferenceService {
         } catch (error) {
             console.error('Token refresh failed:', error);
             await this.handleTokenRefreshError(connectionId, error);
-            throw new Error('Failed to refresh Google Meet tokens');
+            throw VideoConferenceErrorHandler.handleGoogleMeetError(error);
         }
     }
 
@@ -87,18 +86,11 @@ export class GoogleMeetVideoService implements VideoConferenceService {
         await this.ensureValidToken(params.connectionId);
 
         try {
-            // Create a meeting space
+            // Create a meeting space - Google Meet spaces don't have titles in API
             const spaceResponse = await this.meet.spaces.create({
                 requestBody: {
                     config: {
                         accessType: params.settings?.accessType || 'PUBLIC',
-                        moderation: {
-                            enabled: params.settings?.moderationEnabled || false,
-                        },
-                        artifactConfig: {
-                            recordingConfig: { enabled: params.settings?.autoRecord || false },
-                            transcriptionConfig: { enabled: params.settings?.autoTranscribe || false }
-                        }
                     }
                 }
             });
@@ -108,7 +100,7 @@ export class GoogleMeetVideoService implements VideoConferenceService {
             // Store Google Meet specific config
             await db.insert(googleMeetConfigs).values({
                 videoConnectionId: params.connectionId,
-                spaceId: space.name!,
+                spaceId: space.name!.replace('spaces/', ''),
                 meetingCode: space.meetingCode!,
                 accessType: params.settings?.accessType || 'PUBLIC',
                 recordingEnabled: params.settings?.autoRecord || false,
@@ -120,7 +112,7 @@ export class GoogleMeetVideoService implements VideoConferenceService {
             return this.normalizeGoogleMeetSpace(space, params);
         } catch (error) {
             console.error('Failed to create Google Meet:', error);
-            throw this.normalizeGoogleMeetError(error);
+            throw VideoConferenceErrorHandler.handleGoogleMeetError(error);
         }
     }
 
@@ -131,54 +123,25 @@ export class GoogleMeetVideoService implements VideoConferenceService {
             const updateMask: string[] = [];
             const requestBody: any = {};
 
-            if (updates.title) {
-                // Note: Google Meet spaces don't have a title field in the same way
-                // We would store this in our database instead
-            }
-
             if (updates.settings) {
                 requestBody.config = {
-                    // Map waitingRoom to entryPoints.allowJoinBeforeHost for Google Meet
-                    entryPoints: {
-                        allowJoinBeforeHost: !updates.settings.waitingRoom
-                    },
-                    // Map muteOnEntry to audioConfig.muteOnEntry
-                    audioConfig: {
-                        muteOnEntry: updates.settings.muteOnEntry
-                    },
-                    // Map autoRecord and autoTranscribe to artifactConfig
-                    artifactConfig: {
-                        recordingConfig: { enabled: updates.settings.autoRecord },
-                        transcriptionConfig: { enabled: updates.settings.autoTranscribe }
-                    }
+                    accessType: updates.settings.waitingRoom ? 'PRIVATE' : 'PUBLIC',
                 };
-                updateMask.push('config');
+                updateMask.push('config.accessType');
             }
 
             const response = await this.meet.spaces.patch({
-                name: meetingId,
+                name: `spaces/${meetingId}`,
                 requestBody,
                 updateMask: updateMask.join(','),
             });
 
-            // Update our config with only the settings that exist in the VideoMeeting interface
+            // Update our config
             if (updates.settings) {
                 const updateData: any = {
-                    recordingEnabled: updates.settings.autoRecord,
-                    transcriptionEnabled: updates.settings.autoTranscribe,
+                    accessType: updates.settings.waitingRoom ? 'PRIVATE' : 'PUBLIC',
                     updatedAt: new Date(),
                 };
-
-                // Only include these fields if they exist in the settings
-                if ('waitingRoom' in updates.settings) {
-                    updateData.waitingRoom = updates.settings.waitingRoom;
-                }
-                if ('muteOnEntry' in updates.settings) {
-                    updateData.muteOnEntry = updates.settings.muteOnEntry;
-                }
-                if ('maxParticipants' in updates.settings) {
-                    updateData.maxParticipants = updates.settings.maxParticipants;
-                }
 
                 await db.update(googleMeetConfigs)
                     .set(updateData)
@@ -188,7 +151,7 @@ export class GoogleMeetVideoService implements VideoConferenceService {
             return this.normalizeGoogleMeetSpace(response.data, updates);
         } catch (error) {
             console.error('Failed to update Google Meet:', error);
-            throw this.normalizeGoogleMeetError(error);
+            throw VideoConferenceErrorHandler.handleGoogleMeetError(error);
         }
     }
 
@@ -196,18 +159,13 @@ export class GoogleMeetVideoService implements VideoConferenceService {
         await this.ensureValidToken(connectionId);
 
         try {
-            // End active conference if running
-            await this.meet.spaces.endActiveConference({
-                name: meetingId,
-            });
-
-            // Delete from our config
+            // Google Meet spaces don't need to be deleted, just remove from our DB
             await db.delete(googleMeetConfigs)
                 .where(eq(googleMeetConfigs.spaceId, meetingId));
 
         } catch (error) {
             console.error('Failed to delete Google Meet:', error);
-            throw this.normalizeGoogleMeetError(error);
+            throw VideoConferenceErrorHandler.handleGoogleMeetError(error);
         }
     }
 
@@ -216,7 +174,7 @@ export class GoogleMeetVideoService implements VideoConferenceService {
 
         try {
             const response = await this.meet.spaces.get({
-                name: meetingId,
+                name: `spaces/${meetingId}`,
             });
 
             // Get our stored config for additional info
@@ -228,113 +186,25 @@ export class GoogleMeetVideoService implements VideoConferenceService {
             return this.normalizeGoogleMeetSpace(response.data, {}, config[0]);
         } catch (error) {
             console.error('Failed to get Google Meet:', error);
-            throw this.normalizeGoogleMeetError(error);
-        }
-    }
-
-    async listParticipants(connectionId: string, meetingId: string): Promise<MeetingParticipant[]> {
-        await this.ensureValidToken(connectionId);
-
-        try {
-            // Google Meet participants are accessed through conference records
-            const conferences = await this.meet.conferenceRecords.list({
-                filter: `space="${meetingId}"`,
-            });
-
-            if (!conferences.data.conferenceRecords?.length) {
-                return [];
-            }
-
-            const conferenceId = conferences.data.conferenceRecords[0].name!.split('/').pop();
-            const participants = await this.meet.conferenceRecords.participants.list({
-                parent: `conferenceRecords/${conferenceId}`,
-            });
-
-            return participants.data.participants?.map((participant: any) => ({
-                id: participant.name!,
-                email: participant.email!,
-                name: participant.displayName || 'Unknown',
-                role: participant.role === 'HOST' ? 'host' : 'attendee',
-                joinTime: new Date(participant.startTime!),
-                leaveTime: participant.endTime ? new Date(participant.endTime) : undefined,
-                duration: participant.duration || 0,
-            })) || [];
-        } catch (error) {
-            console.error('Failed to list Google Meet participants:', error);
-            throw this.normalizeGoogleMeetError(error);
-        }
-    }
-
-    async listRecordings(connectionId: string, meetingId: string): Promise<MeetingRecording[]> {
-        await this.ensureValidToken(connectionId);
-
-        try {
-            const conferences = await this.meet.conferenceRecords.list({
-                filter: `space="${meetingId}"`,
-            });
-
-            if (!conferences.data.conferenceRecords?.length) {
-                return [];
-            }
-
-            const conferenceId = conferences.data.conferenceRecords[0].name!.split('/').pop();
-            const recordings = await this.meet.conferenceRecords.recordings.list({
-                parent: `conferenceRecords/${conferenceId}`,
-            });
-
-            return recordings.data.recordings?.map((recording: any) => ({
-                id: recording.name!,
-                startTime: new Date(recording.startTime!),
-                endTime: new Date(recording.endTime!),
-                fileSize: recording.fileSize || 0,
-                fileType: recording.format || 'mp4',
-                downloadUrl: recording.driveDestination?.exportUri,
-                status: recording.state === 'COMPLETED' ? 'completed' : 'processing',
-            })) || [];
-        } catch (error) {
-            console.error('Failed to list Google Meet recordings:', error);
-            throw this.normalizeGoogleMeetError(error);
-        }
-    }
-
-    async listTranscripts(connectionId: string, meetingId: string): Promise<MeetingTranscript[]> {
-        await this.ensureValidToken(connectionId);
-
-        try {
-            const conferences = await this.meet.conferenceRecords.list({
-                filter: `space="${meetingId}"`,
-            });
-
-            if (!conferences.data.conferenceRecords?.length) {
-                return [];
-            }
-
-            const conferenceId = conferences.data.conferenceRecords[0].name!.split('/').pop();
-            const transcripts = await this.meet.conferenceRecords.transcripts.list({
-                parent: `conferenceRecords/${conferenceId}`,
-            });
-
-            return transcripts.data.transcripts?.map((transcript: any) => ({
-                id: transcript.name!,
-                language: transcript.languageCode || 'en',
-                wordCount: transcript.wordCount || 0,
-                downloadUrl: transcript.docsDestination?.exportUri,
-                status: transcript.state === 'COMPLETED' ? 'completed' : 'processing',
-            })) || [];
-        } catch (error) {
-            console.error('Failed to list Google Meet transcripts:', error);
-            throw this.normalizeGoogleMeetError(error);
+            throw VideoConferenceErrorHandler.handleGoogleMeetError(error);
         }
     }
 
     async setupWebhook(connectionId: string, options: any): Promise<{ webhookId: string; expirationTime: Date }> {
-        // Google Meet uses Google Cloud Pub/Sub for notifications
-        // This is more complex and would require separate implementation
-        throw new Error('Google Meet webhooks require Google Cloud Pub/Sub setup');
+        // Google Meet uses Google Cloud Pub/Sub for notifications - complex setup
+        throw new VideoConferenceError(
+            'Google Meet webhooks require Google Cloud Pub/Sub setup',
+            'NOT_IMPLEMENTED',
+            false
+        );
     }
 
     async removeWebhook(connectionId: string, webhookId: string): Promise<void> {
-        throw new Error('Google Meet webhooks require Google Cloud Pub/Sub setup');
+        throw new VideoConferenceError(
+            'Google Meet webhooks require Google Cloud Pub/Sub setup',
+            'NOT_IMPLEMENTED',
+            false
+        );
     }
 
     async startMeeting(connectionId: string, meetingId: string): Promise<void> {
@@ -347,11 +217,11 @@ export class GoogleMeetVideoService implements VideoConferenceService {
 
         try {
             await this.meet.spaces.endActiveConference({
-                name: meetingId,
+                name: `spaces/${meetingId}`,
             });
         } catch (error) {
             console.error('Failed to end Google Meet:', error);
-            throw this.normalizeGoogleMeetError(error);
+            throw VideoConferenceErrorHandler.handleGoogleMeetError(error);
         }
     }
 
@@ -363,7 +233,11 @@ export class GoogleMeetVideoService implements VideoConferenceService {
             .limit(1);
 
         if (result.length === 0) {
-            throw new Error(`Video connection not found: ${connectionId}`);
+            throw new VideoConferenceError(
+                `Video connection not found: ${connectionId}`,
+                'CONNECTION_NOT_FOUND',
+                false
+            );
         }
 
         return result[0];
@@ -395,7 +269,7 @@ export class GoogleMeetVideoService implements VideoConferenceService {
         const duration = params.duration || 60;
 
         return {
-            id: space.name!,
+            id: space.name!.replace('spaces/', ''),
             title: params.title || 'Google Meet Space',
             description: params.agenda,
             agenda: params.agenda,
@@ -406,27 +280,13 @@ export class GoogleMeetVideoService implements VideoConferenceService {
             joinUrl: space.meetingUri!,
             meetingCode: space.meetingCode!,
             settings: {
-                isRecurring: false, // Default to false as Google Meet spaces are not recurring by default
-                waitingRoom: config?.waitingRoom || false,
-                muteOnEntry: config?.muteOnEntry || false,
+                isRecurring: false,
+                waitingRoom: config?.accessType === 'PRIVATE' || false,
+                muteOnEntry: false, // Not configurable via API
                 autoRecord: config?.recordingEnabled || false,
                 autoTranscribe: config?.transcriptionEnabled || false,
-                ...(config?.maxParticipants && { maxParticipants: config.maxParticipants })
             },
             providerData: space,
         };
-    }
-
-    private normalizeGoogleMeetError(error: any): Error {
-        if (error.code === 401) {
-            return new Error('Authentication failed - please reconnect your Google Meet account');
-        } else if (error.code === 403) {
-            return new Error('Google Meet access denied - check permissions');
-        } else if (error.code === 404) {
-            return new Error('Meeting space not found');
-        } else if (error.code === 429) {
-            return new Error('Google Meet rate limit exceeded - please try again later');
-        }
-        return error;
     }
 }

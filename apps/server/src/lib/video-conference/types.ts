@@ -112,13 +112,6 @@ export interface VideoConferenceService {
     deleteMeeting(connectionId: string, meetingId: string): Promise<void>;
     getMeeting(connectionId: string, meetingId: string): Promise<VideoMeeting>;
 
-    // Participants
-    listParticipants(connectionId: string, meetingId: string): Promise<MeetingParticipant[]>;
-
-    // Recordings and transcripts
-    listRecordings(connectionId: string, meetingId: string): Promise<MeetingRecording[]>;
-    listTranscripts(connectionId: string, meetingId: string): Promise<MeetingTranscript[]>;
-
     // Webhook management
     setupWebhook(connectionId: string, options: any): Promise<{ webhookId: string; expirationTime: Date }>;
     removeWebhook(connectionId: string, webhookId: string): Promise<void>;

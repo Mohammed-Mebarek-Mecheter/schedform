@@ -41,6 +41,13 @@ export class VideoConferenceErrorHandler {
                 true,
                 error
             );
+        } else if (error.message?.includes('CONNECTION_NOT_FOUND')) {
+            return new VideoConferenceError(
+                error.message,
+                'CONNECTION_NOT_FOUND',
+                false,
+                error
+            );
         }
 
         return new VideoConferenceError(
@@ -78,6 +85,20 @@ export class VideoConferenceErrorHandler {
                 'Google Meet rate limit exceeded - please try again later',
                 'RATE_LIMITED',
                 true,
+                error
+            );
+        } else if (error.message?.includes('CONNECTION_NOT_FOUND')) {
+            return new VideoConferenceError(
+                error.message,
+                'CONNECTION_NOT_FOUND',
+                false,
+                error
+            );
+        } else if (error.message?.includes('NOT_IMPLEMENTED')) {
+            return new VideoConferenceError(
+                error.message,
+                'NOT_IMPLEMENTED',
+                false,
                 error
             );
         }

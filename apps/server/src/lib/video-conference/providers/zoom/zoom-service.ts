@@ -2,7 +2,8 @@
 import type { VideoConferenceService, VideoMeeting, MeetingParticipant, MeetingRecording, MeetingTranscript, ZoomConfig } from '../../types';
 import { db } from '@/db';
 import { videoConferenceConnections, zoomWebhooks } from '@/db/schema/video-conference-core';
-import {and, eq, sql} from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
+import { VideoConferenceError, VideoConferenceErrorHandler } from '../../error-handler';
 
 interface ZoomTokenResponse {
     access_token: string;
@@ -11,22 +12,24 @@ interface ZoomTokenResponse {
     scope?: string;
 }
 
-interface ZoomParticipant {
+interface ZoomMeeting {
     id: string;
-    user_email: string;
-    name: string;
-    role: 'host' | 'attendee' | 'co-host';
-    join_time: string;
-    leave_time?: string;
+    topic: string;
+    agenda?: string;
+    start_time: string;
     duration: number;
-}
-
-interface ZoomParticipantsResponse {
-    participants: ZoomParticipant[];
-    page_count: number;
-    page_size: number;
-    total_records: number;
-    next_page_token?: string;
+    timezone: string;
+    join_url: string;
+    start_url: string;
+    password?: string;
+    settings: {
+        host_video: boolean;
+        participant_video: boolean;
+        join_before_host: boolean;
+        mute_upon_entry: boolean;
+        waiting_room: boolean;
+        auto_recording: 'none' | 'local' | 'cloud';
+    };
 }
 
 export class ZoomVideoService implements VideoConferenceService {
@@ -72,7 +75,7 @@ export class ZoomVideoService implements VideoConferenceService {
         } catch (error) {
             console.error('Zoom connection validation failed:', error);
             await this.handleConnectionError(connectionId, error);
-            return false;
+            throw VideoConferenceErrorHandler.handleZoomError(error);
         }
     }
 
@@ -112,7 +115,7 @@ export class ZoomVideoService implements VideoConferenceService {
         } catch (error) {
             console.error('Zoom token refresh failed:', error);
             await this.handleTokenRefreshError(connectionId, error);
-            throw new Error('Failed to refresh Zoom tokens');
+            throw VideoConferenceErrorHandler.handleZoomError(error);
         }
     }
 
@@ -127,26 +130,26 @@ export class ZoomVideoService implements VideoConferenceService {
     }): Promise<VideoMeeting> {
         const accessToken = await this.ensureValidToken(params.connectionId);
 
-        const meetingData: any = {
+        const meetingData = {
             topic: params.title,
             type: 2, // Scheduled meeting
-            start_time: params.startTime.toISOString(),
+            start_time: params.startTime.toISOString().replace(/\.\d{3}Z$/, 'Z'), // Zoom expects specific format
             duration: params.duration,
             timezone: params.timeZone,
             agenda: params.agenda,
             settings: {
                 host_video: true,
                 participant_video: false,
-                join_before_host: false,
+                join_before_host: params.settings?.waitingRoom ? false : true,
                 mute_upon_entry: params.settings?.muteOnEntry || false,
-                waiting_room: params.settings?.waitingRoom || true,
+                waiting_room: params.settings?.waitingRoom || false,
                 auto_recording: params.settings?.autoRecord ? 'cloud' : 'none',
-                ...params.settings,
+                contact_email: params.connectionId, // Use connection email
             },
         };
 
         try {
-            const response = await this.makeZoomRequest(accessToken, '/users/me/meetings', {
+            const response = await this.makeZoomRequest<ZoomMeeting>(accessToken, '/users/me/meetings', {
                 method: 'POST',
                 body: JSON.stringify(meetingData),
             });
@@ -154,7 +157,7 @@ export class ZoomVideoService implements VideoConferenceService {
             return this.normalizeZoomMeeting(response);
         } catch (error) {
             console.error('Failed to create Zoom meeting:', error);
-            throw this.normalizeZoomError(error);
+            throw VideoConferenceErrorHandler.handleZoomError(error);
         }
     }
 
@@ -163,20 +166,31 @@ export class ZoomVideoService implements VideoConferenceService {
 
         const updateData: any = {};
         if (updates.title) updateData.topic = updates.title;
-        if (updates.startTime) updateData.start_time = updates.startTime.toISOString();
+        if (updates.startTime) updateData.start_time = updates.startTime.toISOString().replace(/\.\d{3}Z$/, 'Z');
         if (updates.duration) updateData.duration = updates.duration;
         if (updates.agenda) updateData.agenda = updates.agenda;
 
+        if (updates.settings) {
+            updateData.settings = {
+                join_before_host: updates.settings.waitingRoom ? false : true,
+                mute_upon_entry: updates.settings.muteOnEntry || false,
+                waiting_room: updates.settings.waitingRoom || false,
+                auto_recording: updates.settings.autoRecord ? 'cloud' : 'none',
+            };
+        }
+
         try {
-            const response = await this.makeZoomRequest(accessToken, `/meetings/${meetingId}`, {
+            await this.makeZoomRequest(accessToken, `/meetings/${meetingId}`, {
                 method: 'PATCH',
                 body: JSON.stringify(updateData),
             });
 
+            // Get updated meeting
+            const response = await this.makeZoomRequest<ZoomMeeting>(accessToken, `/meetings/${meetingId}`);
             return this.normalizeZoomMeeting(response);
         } catch (error) {
             console.error('Failed to update Zoom meeting:', error);
-            throw this.normalizeZoomError(error);
+            throw VideoConferenceErrorHandler.handleZoomError(error);
         }
     }
 
@@ -189,7 +203,7 @@ export class ZoomVideoService implements VideoConferenceService {
             });
         } catch (error) {
             console.error('Failed to delete Zoom meeting:', error);
-            throw this.normalizeZoomError(error);
+            throw VideoConferenceErrorHandler.handleZoomError(error);
         }
     }
 
@@ -197,111 +211,53 @@ export class ZoomVideoService implements VideoConferenceService {
         const accessToken = await this.ensureValidToken(connectionId);
 
         try {
-            const response = await this.makeZoomRequest(accessToken, `/meetings/${meetingId}`);
+            const response = await this.makeZoomRequest<ZoomMeeting>(accessToken, `/meetings/${meetingId}`);
             return this.normalizeZoomMeeting(response);
         } catch (error) {
             console.error('Failed to get Zoom meeting:', error);
-            throw this.normalizeZoomError(error);
+            throw VideoConferenceErrorHandler.handleZoomError(error);
         }
-    }
-
-    async listParticipants(connectionId: string, meetingId: string): Promise<MeetingParticipant[]> {
-        const accessToken = await this.ensureValidToken(connectionId);
-
-        try {
-            const response = await this.makeZoomRequest<ZoomParticipantsResponse>(
-            accessToken,
-            `/report/meetings/${meetingId}/participants`
-        );
-
-        if (!response.participants) {
-            return [];
-        }
-
-            return response.participants.map((participant: any) => ({
-                id: participant.id,
-                email: participant.user_email,
-                name: participant.name,
-                role: participant.role === 'host' ? 'host' : 'attendee',
-                joinTime: new Date(participant.join_time),
-                leaveTime: participant.leave_time ? new Date(participant.leave_time) : undefined,
-                duration: participant.duration,
-            }));
-        } catch (error) {
-            console.error('Failed to list Zoom participants:', error);
-            throw this.normalizeZoomError(error);
-        }
-    }
-
-    async listRecordings(connectionId: string, meetingId: string): Promise<MeetingRecording[]> {
-        const accessToken = await this.ensureValidToken(connectionId);
-
-        try {
-            const response = await this.makeZoomRequest(accessToken, `/meetings/${meetingId}/recordings`);
-
-            return response.recording_files.map((recording: any) => ({
-                id: recording.id,
-                startTime: new Date(recording.recording_start),
-                endTime: new Date(recording.recording_end),
-                fileSize: recording.file_size,
-                fileType: recording.file_type,
-                downloadUrl: recording.download_url,
-                status: recording.status === 'completed' ? 'completed' : 'processing',
-            }));
-        } catch (error) {
-            console.error('Failed to list Zoom recordings:', error);
-            throw this.normalizeZoomError(error);
-        }
-    }
-
-    async listTranscripts(connectionId: string, meetingId: string): Promise<MeetingTranscript[]> {
-        // Zoom transcripts are part of recordings
-        const recordings = await this.listRecordings(connectionId, meetingId);
-
-        // Filter for audio transcripts
-        return recordings
-            .filter(rec => rec.fileType === 'M4A')
-            .map(rec => ({
-                id: rec.id,
-                language: 'en', // Zoom doesn't provide language info in basic API
-                wordCount: 0, // Would need additional API call
-                downloadUrl: rec.downloadUrl,
-                status: rec.status,
-            }));
     }
 
     async setupWebhook(connectionId: string, options: any): Promise<{ webhookId: string; expirationTime: Date }> {
         const accessToken = await this.ensureValidToken(connectionId);
-        const webhookId = `webhook-${connectionId}-${Date.now()}`;
         const expirationTime = new Date(Date.now() + (30 * 24 * 60 * 60 * 1000)); // 30 days
 
         try {
-            const response = await this.makeZoomRequest(accessToken, '/webhooks', {
+            const eventsToSubscribe = [
+                'meeting.created',
+                'meeting.updated',
+                'meeting.deleted',
+                'meeting.started',
+                'meeting.ended',
+            ];
+
+            const response = await this.makeZoomRequest<any>(accessToken, '/webhooks', {
                 method: 'POST',
                 body: JSON.stringify({
                     url: options.endpointUrl,
                     auth_user: options.authUser,
                     auth_password: options.authPassword,
-                    events: options.events || ['meeting.started', 'meeting.ended', 'recording.completed'],
+                    events: eventsToSubscribe,
                 }),
             });
 
             await db.insert(zoomWebhooks).values({
                 videoConnectionId: connectionId,
-                webhookId: response.webhook_id,
-                eventType: options.events?.join(',') || 'meeting.started,meeting.ended,recording.completed',
+                webhookId: response.id,
+                eventType: eventsToSubscribe.join(','),
                 endpointUrl: options.endpointUrl,
                 verificationToken: options.verificationToken,
                 createdAt: new Date(),
             });
 
             return {
-                webhookId: response.webhook_id,
+                webhookId: response.id,
                 expirationTime,
             };
         } catch (error) {
             console.error('Failed to setup Zoom webhook:', error);
-            throw this.normalizeZoomError(error);
+            throw VideoConferenceErrorHandler.handleZoomError(error);
         }
     }
 
@@ -318,13 +274,12 @@ export class ZoomVideoService implements VideoConferenceService {
 
         } catch (error) {
             console.error('Failed to remove Zoom webhook:', error);
-            throw this.normalizeZoomError(error);
+            throw VideoConferenceErrorHandler.handleZoomError(error);
         }
     }
 
     async startMeeting(connectionId: string, meetingId: string): Promise<void> {
         // Zoom meetings start automatically when host joins
-        // This method would typically send a notification or update status
         console.log(`Starting Zoom meeting ${meetingId}`);
     }
 
@@ -338,7 +293,7 @@ export class ZoomVideoService implements VideoConferenceService {
             });
         } catch (error) {
             console.error('Failed to end Zoom meeting:', error);
-            throw this.normalizeZoomError(error);
+            throw VideoConferenceErrorHandler.handleZoomError(error);
         }
     }
 
@@ -350,7 +305,11 @@ export class ZoomVideoService implements VideoConferenceService {
             .limit(1);
 
         if (result.length === 0) {
-            throw new Error(`Video connection not found: ${connectionId}`);
+            throw new VideoConferenceError(
+                `Video connection not found: ${connectionId}`,
+                'CONNECTION_NOT_FOUND',
+                false
+            );
         }
 
         return result[0];
@@ -377,41 +336,29 @@ export class ZoomVideoService implements VideoConferenceService {
             .where(eq(videoConferenceConnections.id, connectionId));
     }
 
-    private normalizeZoomMeeting(zoomMeeting: any): VideoMeeting {
+    private normalizeZoomMeeting(zoomMeeting: ZoomMeeting): VideoMeeting {
+        const startTime = new Date(zoomMeeting.start_time);
+
         return {
-            id: zoomMeeting.id,
+            id: zoomMeeting.id.toString(),
             title: zoomMeeting.topic,
             description: zoomMeeting.agenda,
             agenda: zoomMeeting.agenda,
-            startTime: new Date(zoomMeeting.start_time),
-            endTime: new Date(new Date(zoomMeeting.start_time).getTime() + zoomMeeting.duration * 60000),
+            startTime: startTime,
+            endTime: new Date(startTime.getTime() + zoomMeeting.duration * 60000),
             timeZone: zoomMeeting.timezone,
             duration: zoomMeeting.duration,
             joinUrl: zoomMeeting.join_url,
             hostUrl: zoomMeeting.start_url,
             password: zoomMeeting.password,
             settings: {
-                isRecurring: zoomMeeting.type === 8, // 8 is recurring meeting
-                maxParticipants: zoomMeeting.settings?.participant_video ? 100 : 300, // Approximate
-                waitingRoom: zoomMeeting.settings?.waiting_room || false,
-                muteOnEntry: zoomMeeting.settings?.mute_upon_entry || false,
-                autoRecord: zoomMeeting.settings?.auto_recording !== 'none',
-                autoTranscribe: zoomMeeting.settings?.auto_recording === 'cloud' && zoomMeeting.settings?.auto_transcription,
+                isRecurring: false, // Simplified for MVP
+                waitingRoom: zoomMeeting.settings.waiting_room,
+                muteOnEntry: zoomMeeting.settings.mute_upon_entry,
+                autoRecord: zoomMeeting.settings.auto_recording !== 'none',
+                autoTranscribe: zoomMeeting.settings.auto_recording === 'cloud',
             },
-            providerData: zoomMeeting,
+            providerData: { ...zoomMeeting },
         };
-    }
-
-    private normalizeZoomError(error: any): Error {
-        if (error.message?.includes('401')) {
-            return new Error('Authentication failed - please reconnect your Zoom account');
-        } else if (error.message?.includes('403')) {
-            return new Error('Zoom access denied - check permissions');
-        } else if (error.message?.includes('404')) {
-            return new Error('Meeting not found');
-        } else if (error.message?.includes('429')) {
-            return new Error('Zoom rate limit exceeded - please try again later');
-        }
-        return error;
     }
 }

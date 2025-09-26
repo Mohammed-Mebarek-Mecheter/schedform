@@ -1,7 +1,6 @@
-﻿// workflows.ts
+﻿// src/db/schema/workflows.ts
 import {
     pgTable,
-    varchar,
     text,
     timestamp,
     boolean,
@@ -11,11 +10,12 @@ import {
     index,
     uniqueIndex,
 } from "drizzle-orm/pg-core";
-import { relations } from "drizzle-orm";
-import { users } from "@/db/schema/auth"; // Updated import
+import { relations, sql } from "drizzle-orm";
+import { users, organizations, teams } from "@/db/schema/auth";
 import { forms } from "@/db/schema/forms";
 import { eventTypes } from "@/db/schema/scheduling";
 import { supportedLanguages } from "@/db/schema/localization";
+import { novuWorkflows, novuTriggers } from "@/db/schema/novu";
 
 /* ---------------- Enums ---------------- */
 export const triggerTypeEnum = pgEnum("trigger_type", [
@@ -30,15 +30,15 @@ export const triggerTypeEnum = pgEnum("trigger_type", [
     "scheduled_time",
 ]);
 
+// Updated to work through Novu instead of direct integrations
 export const actionTypeEnum = pgEnum("action_type", [
-    "send_email",
+    "send_novu_notification", // Replaces send_email, send_slack_message, send_sms
     "webhook_call",
     "zapier_trigger",
     "create_booking",
     "update_booking",
     "assign_team_member",
     "add_to_crm",
-    "send_slack_message",
     "create_task",
     "delay",
     "conditional_branch",
@@ -60,6 +60,7 @@ export const executionStatusEnum = pgEnum("execution_status", [
     "retrying",
 ]);
 
+// Simplified integration types - most go through Novu now
 export const integrationTypeEnum = pgEnum("integration_type", [
     "zapier",
     "webhook",
@@ -67,38 +68,24 @@ export const integrationTypeEnum = pgEnum("integration_type", [
     "outlook_calendar",
     "zoom",
     "google_meet",
-    "slack",
     "hubspot",
-    "salesforce",
-    "pipedrive",
-    "notion",
-    "airtable",
-    "mailchimp",
-    "convertkit",
-    "stripe",
-    "paypal",
+    "novu", // New Novu integration type
 ]);
 
 /* ---------------- Workflows ---------------- */
 export const workflows = pgTable(
     "workflows",
     {
-        id: varchar("id", { length: 36 })
-            .primaryKey()
-            .$defaultFn(() => crypto.randomUUID()),
+        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
 
-        userId: text("user_id") // Changed to text to match new auth schema
-            .notNull()
-            .references(() => users.id, { onDelete: "cascade" }),
-        formId: varchar("form_id", { length: 36 }).references(() => forms.id, {
-            onDelete: "cascade",
-        }),
-        eventTypeId: varchar("event_type_id", { length: 36 }).references(
-            () => eventTypes.id,
-            { onDelete: "cascade" },
-        ),
+        userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+        organizationId: text("organization_id").notNull().references(() => organizations.id, { onDelete: "cascade" }),
+        teamId: text("team_id").references(() => teams.id, { onDelete: "set null" }),
 
-        name: varchar("name", { length: 255 }).notNull(),
+        formId: text("form_id").references(() => forms.id, { onDelete: "cascade" }),
+        eventTypeId: text("event_type_id").references(() => eventTypes.id, { onDelete: "cascade" }),
+
+        name: text("name").notNull(),
         description: text("description"),
         status: workflowStatusEnum("status").notNull().default("draft"),
 
@@ -107,6 +94,10 @@ export const workflows = pgTable(
         triggerConditions: jsonb("trigger_conditions"),
 
         workflowDefinition: jsonb("workflow_definition").notNull(),
+
+        // Novu integration
+        novuWorkflowId: text("novu_workflow_id").references(() => novuWorkflows.id, { onDelete: "set null" }),
+        useNovu: boolean("use_novu").notNull().default(true), // Default to using Novu
 
         isActive: boolean("is_active").default(false),
         maxExecutionsPerDay: integer("max_executions_per_day"),
@@ -117,12 +108,20 @@ export const workflows = pgTable(
         failedExecutions: integer("failed_executions").default(0),
         lastExecutedAt: timestamp("last_executed_at"),
 
+        // Localization support
+        defaultLanguage: text("default_language").references(() => supportedLanguages.code, { onDelete: "set null" }),
+        supportedLanguages: jsonb("supported_languages"), // Array of language codes
+
         createdAt: timestamp("created_at").notNull().defaultNow(),
         updatedAt: timestamp("updated_at").notNull().defaultNow(),
     },
     (t) => ({
-        userIdx: index("workflows_user_idx").on(t.userId),
-        uniqueName: uniqueIndex("workflows_user_name_idx").on(t.userId, t.name),
+        idxUser: index("workflows_user_idx").on(t.userId),
+        idxOrganization: index("workflows_organization_idx").on(t.organizationId),
+        idxTeam: index("workflows_team_idx").on(t.teamId),
+        idxNovuWorkflow: index("workflows_novu_workflow_idx").on(t.novuWorkflowId),
+        idxActiveNovu: index("workflows_active_novu_idx").on(t.isActive, t.useNovu),
+        uniqueNamePerOrg: uniqueIndex("workflows_org_name_idx").on(t.organizationId, t.name),
     }),
 );
 
@@ -130,15 +129,15 @@ export const workflows = pgTable(
 export const workflowExecutions = pgTable(
     "workflow_executions",
     {
-        id: varchar("id", { length: 36 })
-            .primaryKey()
-            .$defaultFn(() => crypto.randomUUID()),
+        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
 
-        workflowId: varchar("workflow_id", { length: 36 })
-            .notNull()
-            .references(() => workflows.id, { onDelete: "cascade" }),
+        workflowId: text("workflow_id").notNull().references(() => workflows.id, { onDelete: "cascade" }),
+        organizationId: text("organization_id").notNull().references(() => organizations.id, { onDelete: "cascade" }),
 
-        triggeredBy: varchar("triggered_by", { length: 100 }).notNull(),
+        // Link to Novu trigger if using Novu
+        novuTriggerId: text("novu_trigger_id").references(() => novuTriggers.id, { onDelete: "set null" }),
+
+        triggeredBy: text("triggered_by").notNull(),
         triggerData: jsonb("trigger_data"),
 
         status: executionStatusEnum("status").notNull().default("pending"),
@@ -154,34 +153,39 @@ export const workflowExecutions = pgTable(
         completedAt: timestamp("completed_at"),
         executionDuration: integer("execution_duration"),
 
+        // Novu-specific tracking
+        novuTransactionId: text("novu_transaction_id"), // For tracking in Novu
+        novuExecutionResults: jsonb("novu_execution_results"),
+
         createdAt: timestamp("created_at").notNull().defaultNow(),
         updatedAt: timestamp("updated_at").notNull().defaultNow(),
     },
     (t) => ({
-        wfIdx: index("workflow_executions_wf_idx").on(t.workflowId),
-        statusIdx: index("workflow_executions_status_idx").on(t.status),
+        idxWorkflow: index("workflow_executions_workflow_idx").on(t.workflowId),
+        idxOrganization: index("workflow_executions_organization_idx").on(t.organizationId),
+        idxStatus: index("workflow_executions_status_idx").on(t.status),
+        idxNovuTrigger: index("workflow_executions_novu_trigger_idx").on(t.novuTriggerId),
+        idxNovuTransaction: index("workflow_executions_novu_transaction_idx").on(t.novuTransactionId),
     }),
 );
 
-/* ---------------- Integrations ---------------- */
+/* ---------------- Integrations - Simplified for Novu-first approach ---------------- */
 export const integrations = pgTable(
     "integrations",
     {
-        id: varchar("id", { length: 36 })
-            .primaryKey()
-            .$defaultFn(() => crypto.randomUUID()),
+        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
 
-        userId: text("user_id") // Changed to text to match new auth schema
-            .notNull()
-            .references(() => users.id, { onDelete: "cascade" }),
+        userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+        organizationId: text("organization_id").notNull().references(() => organizations.id, { onDelete: "cascade" }),
 
         type: integrationTypeEnum("type").notNull(),
-        name: varchar("name", { length: 255 }).notNull(),
+        name: text("name").notNull(),
         description: text("description"),
 
         isActive: boolean("is_active").default(true),
         isConnected: boolean("is_connected").default(false),
 
+        // For non-Novu integrations
         accessToken: text("access_token"),
         refreshToken: text("refresh_token"),
         tokenExpiresAt: timestamp("token_expires_at"),
@@ -199,31 +203,25 @@ export const integrations = pgTable(
         updatedAt: timestamp("updated_at").notNull().defaultNow(),
     },
     (t) => ({
-        userIdx: index("integrations_user_idx").on(t.userId),
-        uniqueType: uniqueIndex("integrations_user_type_idx").on(t.userId, t.type),
+        idxUser: index("integrations_user_idx").on(t.userId),
+        idxOrganization: index("integrations_organization_idx").on(t.organizationId),
+        idxType: index("integrations_type_idx").on(t.type, t.isActive),
+        uniqueOrgType: uniqueIndex("integrations_org_type_idx").on(t.organizationId, t.type),
     }),
 );
 
-/* ---------------- Webhooks ---------------- */
+/* ---------------- Webhooks - Still needed for external systems ---------------- */
 export const webhooks = pgTable(
     "webhooks",
     {
-        id: varchar("id", { length: 36 })
-            .primaryKey()
-            .$defaultFn(() => crypto.randomUUID()),
+        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
 
-        userId: text("user_id") // Changed to text to match new auth schema
-            .notNull()
-            .references(() => users.id, { onDelete: "cascade" }),
-        formId: varchar("form_id", { length: 36 }).references(() => forms.id, {
-            onDelete: "cascade",
-        }),
-        eventTypeId: varchar("event_type_id", { length: 36 }).references(
-            () => eventTypes.id,
-            { onDelete: "cascade" },
-        ),
+        userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+        organizationId: text("organization_id").notNull().references(() => organizations.id, { onDelete: "cascade" }),
+        formId: text("form_id").references(() => forms.id, { onDelete: "cascade" }),
+        eventTypeId: text("event_type_id").references(() => eventTypes.id, { onDelete: "cascade" }),
 
-        name: varchar("name", { length: 255 }).notNull(),
+        name: text("name").notNull(),
         url: text("url").notNull(),
         secret: text("secret"),
 
@@ -234,7 +232,7 @@ export const webhooks = pgTable(
         retryPolicy: jsonb("retry_policy"),
 
         headers: jsonb("headers"),
-        authType: varchar("auth_type", { length: 50 }),
+        authType: text("auth_type"),
         authConfig: jsonb("auth_config"),
 
         totalCalls: integer("total_calls").default(0),
@@ -247,8 +245,10 @@ export const webhooks = pgTable(
         updatedAt: timestamp("updated_at").notNull().defaultNow(),
     },
     (t) => ({
-        userIdx: index("webhooks_user_idx").on(t.userId),
-        uniqueUrl: uniqueIndex("webhooks_user_url_idx").on(t.userId, t.url),
+        idxUser: index("webhooks_user_idx").on(t.userId),
+        idxOrganization: index("webhooks_organization_idx").on(t.organizationId),
+        idxActive: index("webhooks_active_idx").on(t.isActive),
+        uniqueOrgUrl: uniqueIndex("webhooks_org_url_idx").on(t.organizationId, t.url),
     }),
 );
 
@@ -256,21 +256,18 @@ export const webhooks = pgTable(
 export const webhookDeliveries = pgTable(
     "webhook_deliveries",
     {
-        id: varchar("id", { length: 36 })
-            .primaryKey()
-            .$defaultFn(() => crypto.randomUUID()),
+        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
 
-        webhookId: varchar("webhook_id", { length: 36 })
-            .notNull()
-            .references(() => webhooks.id, { onDelete: "cascade" }),
+        webhookId: text("webhook_id").notNull().references(() => webhooks.id, { onDelete: "cascade" }),
+        organizationId: text("organization_id").notNull().references(() => organizations.id, { onDelete: "cascade" }),
 
-        eventType: varchar("event_type", { length: 100 }).notNull(),
+        eventType: text("event_type").notNull(),
         payload: jsonb("payload").notNull(),
 
         requestHeaders: jsonb("request_headers"),
         requestBody: text("request_body"),
 
-        status: varchar("status", { length: 50 }).notNull(),
+        status: text("status").notNull(),
         httpStatusCode: integer("http_status_code"),
         responseHeaders: jsonb("response_headers"),
         responseBody: text("response_body"),
@@ -283,32 +280,34 @@ export const webhookDeliveries = pgTable(
         createdAt: timestamp("created_at").notNull().defaultNow(),
     },
     (t) => ({
-        webhookIdx: index("webhook_deliveries_webhook_idx").on(t.webhookId),
-        statusIdx: index("webhook_deliveries_status_idx").on(t.status),
+        idxWebhook: index("webhook_deliveries_webhook_idx").on(t.webhookId),
+        idxOrganization: index("webhook_deliveries_organization_idx").on(t.organizationId),
+        idxStatus: index("webhook_deliveries_status_idx").on(t.status),
     }),
 );
 
-/* ---------------- Email Templates ---------------- */
-export const emailTemplates = pgTable(
-    "email_templates",
+/* ---------------- Notification Templates - Now focused on Novu templates ---------------- */
+export const notificationTemplates = pgTable(
+    "notification_templates",
     {
-        id: varchar("id", { length: 36 })
-            .primaryKey()
-            .$defaultFn(() => crypto.randomUUID()),
+        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
 
-        userId: text("user_id") // Changed to text to match new auth schema
-            .notNull()
-            .references(() => users.id, { onDelete: "cascade" }),
+        userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+        organizationId: text("organization_id").notNull().references(() => organizations.id, { onDelete: "cascade" }),
 
-        name: varchar("name", { length: 255 }).notNull(),
+        name: text("name").notNull(),
         description: text("description"),
-        type: varchar("type", { length: 100 }).notNull(),
+        templateType: text("template_type").notNull(), // "email", "in_app", "chat"
 
-        subject: varchar("subject", { length: 255 }).notNull(),
-        htmlBody: text("html_body").notNull(),
-        textBody: text("text_body"),
+        // Novu workflow reference
+        novuWorkflowId: text("novu_workflow_id").references(() => novuWorkflows.id, { onDelete: "set null" }),
 
-        defaultLanguage: varchar("default_language", { length: 10 }).references(() => supportedLanguages.code, { onDelete: "set null" }),
+        // Template content for different channels
+        emailTemplate: jsonb("email_template"), // { subject, body, variables }
+        inAppTemplate: jsonb("in_app_template"), // { title, body, avatar, cta }
+        chatTemplate: jsonb("chat_template"), // { text, blocks, attachments }
+
+        defaultLanguage: text("default_language").references(() => supportedLanguages.code, { onDelete: "set null" }),
         supportedLanguages: jsonb("supported_languages"), // Array of language codes
         autoDetectLanguage: boolean("auto_detect_language").default(true),
 
@@ -324,114 +323,83 @@ export const emailTemplates = pgTable(
         updatedAt: timestamp("updated_at").notNull().defaultNow(),
     },
     (t) => ({
-        userIdx: index("email_templates_user_idx").on(t.userId),
-        uniqueName: uniqueIndex("email_templates_user_name_idx").on(
-            t.userId,
-            t.name,
-        ),
+        idxUser: index("notification_templates_user_idx").on(t.userId),
+        idxOrganization: index("notification_templates_organization_idx").on(t.organizationId),
+        idxType: index("notification_templates_type_idx").on(t.templateType),
+        idxNovuWorkflow: index("notification_templates_novu_workflow_idx").on(t.novuWorkflowId),
+        uniqueOrgName: uniqueIndex("notification_templates_org_name_idx").on(t.organizationId, t.name),
     }),
 );
 
-/* ---------------- Notification Queue ---------------- */
+/* ---------------- Notification Queue - Now routing through Novu ---------------- */
 export const notificationQueue = pgTable(
     "notification_queue",
     {
-        id: varchar("id", { length: 36 })
-            .primaryKey()
-            .$defaultFn(() => crypto.randomUUID()),
+        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
 
-        userId: text("user_id") // Changed to text to match new auth schema
-            .notNull()
-            .references(() => users.id, { onDelete: "cascade" }),
+        userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+        organizationId: text("organization_id").notNull().references(() => organizations.id, { onDelete: "cascade" }),
 
-        type: varchar("type", { length: 50 }).notNull(), // email, slack
-        recipient: varchar("recipient", { length: 255 }).notNull(),
-        subject: varchar("subject", { length: 255 }),
+        // Notification details
+        type: text("type").notNull(), // email, in_app, chat
+        recipient: text("recipient").notNull(),
+        subject: text("subject"),
         message: text("message").notNull(),
 
-        templateId: varchar("template_id", { length: 36 }),
+        templateId: text("template_id").references(() => notificationTemplates.id, { onDelete: "set null" }),
         templateData: jsonb("template_data"),
+
+        // Novu-specific fields
+        novuWorkflowId: text("novu_workflow_id"),
+        novuTransactionId: text("novu_transaction_id"),
+        routeThroughNovu: boolean("route_through_novu").notNull().default(true),
 
         scheduledFor: timestamp("scheduled_for"),
         priority: integer("priority").default(5),
 
-        status: varchar("status", { length: 50 }).default("pending"),
+        status: text("status").default("pending"),
         attempts: integer("attempts").default(0),
         maxAttempts: integer("max_attempts").default(3),
         lastAttemptAt: timestamp("last_attempt_at"),
         lastError: text("last_error"),
 
-        externalId: varchar("external_id", { length: 255 }),
-        deliveryStatus: varchar("delivery_status", { length: 50 }),
+        externalId: text("external_id"), // Novu message ID
+        deliveryStatus: text("delivery_status"),
 
         createdAt: timestamp("created_at").notNull().defaultNow(),
         processedAt: timestamp("processed_at"),
     },
     (t) => ({
-        userIdx: index("notification_queue_user_idx").on(t.userId),
-        statusIdx: index("notification_queue_status_idx").on(t.status),
+        idxUser: index("notification_queue_user_idx").on(t.userId),
+        idxOrganization: index("notification_queue_organization_idx").on(t.organizationId),
+        idxStatus: index("notification_queue_status_idx").on(t.status),
+        idxNovuWorkflow: index("notification_queue_novu_workflow_idx").on(t.novuWorkflowId),
+        idxScheduled: index("notification_queue_scheduled_idx").on(t.scheduledFor),
     }),
 );
 
-/* ---------------- AI Insights ---------------- */
-export const aiInsights = pgTable(
-    "ai_insights",
-    {
-        id: varchar("id", { length: 36 })
-            .primaryKey()
-            .$defaultFn(() => crypto.randomUUID()),
-
-        userId: text("user_id") // Changed to text to match new auth schema
-            .notNull()
-            .references(() => users.id, { onDelete: "cascade" }),
-
-        relatedType: varchar("related_type", { length: 50 }).notNull(),
-        relatedId: varchar("related_id", { length: 36 }).notNull(),
-
-        insightType: varchar("insight_type", { length: 100 }).notNull(),
-        confidence: integer("confidence"),
-
-        summary: text("summary"),
-        details: jsonb("details"),
-        recommendations: jsonb("recommendations"),
-
-        modelVersion: varchar("model_version", { length: 50 }),
-        processingTime: integer("processing_time"),
-
-        createdAt: timestamp("created_at").notNull().defaultNow(),
-    },
-    (t) => ({
-        userIdx: index("ai_insights_user_idx").on(t.userId),
-        relatedIdx: index("ai_insights_related_idx").on(t.relatedType, t.relatedId),
-    }),
-);
-
-/* ---------------- Automation Rules ---------------- */
+/* ---------------- Automation Rules - Updated for Novu ---------------- */
 export const automationRules = pgTable(
     "automation_rules",
     {
-        id: varchar("id", { length: 36 })
-            .primaryKey()
-            .$defaultFn(() => crypto.randomUUID()),
+        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
 
-        userId: text("user_id") // Changed to text to match new auth schema
-            .notNull()
-            .references(() => users.id, { onDelete: "cascade" }),
-        formId: varchar("form_id", { length: 36 }).references(() => forms.id, {
-            onDelete: "cascade",
-        }),
-        eventTypeId: varchar("event_type_id", { length: 36 }).references(
-            () => eventTypes.id,
-            { onDelete: "cascade" },
-        ),
+        userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+        organizationId: text("organization_id").notNull().references(() => organizations.id, { onDelete: "cascade" }),
+        formId: text("form_id").references(() => forms.id, { onDelete: "cascade" }),
+        eventTypeId: text("event_type_id").references(() => eventTypes.id, { onDelete: "cascade" }),
 
-        name: varchar("name", { length: 255 }).notNull(),
+        name: text("name").notNull(),
         description: text("description"),
         isActive: boolean("is_active").default(true),
 
         triggerType: triggerTypeEnum("trigger_type").notNull(),
         conditions: jsonb("conditions").notNull(),
         actions: jsonb("actions").notNull(),
+
+        // Novu integration for notifications
+        novuWorkflowId: text("novu_workflow_id"),
+        useNovu: boolean("use_novu").notNull().default(true),
 
         maxExecutionsPerDay: integer("max_executions_per_day"),
         cooldownMinutes: integer("cooldown_minutes"),
@@ -443,40 +411,40 @@ export const automationRules = pgTable(
         updatedAt: timestamp("updated_at").notNull().defaultNow(),
     },
     (t) => ({
-        userIdx: index("automation_rules_user_idx").on(t.userId),
-        uniqueName: uniqueIndex("automation_rules_user_name_idx").on(
-            t.userId,
-            t.name,
-        ),
+        idxUser: index("automation_rules_user_idx").on(t.userId),
+        idxOrganization: index("automation_rules_organization_idx").on(t.organizationId),
+        idxNovuWorkflow: index("automation_rules_novu_workflow_idx").on(t.novuWorkflowId),
+        uniqueOrgName: uniqueIndex("automation_rules_org_name_idx").on(t.organizationId, t.name),
     }),
 );
 
-/* ---------------- Email Template Translations ---------------- */
-export const emailTemplateTranslations = pgTable(
-    "email_template_translations",
+/* ---------------- Template Translations ---------------- */
+export const notificationTemplateTranslations = pgTable(
+    "notification_template_translations",
     {
-        id: varchar("id", { length: 36 }).primaryKey().$defaultFn(() => crypto.randomUUID()),
-        templateId: varchar("template_id", { length: 36 }).notNull().references(() => emailTemplates.id, { onDelete: "cascade" }),
+        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
+        templateId: text("template_id").notNull().references(() => notificationTemplates.id, { onDelete: "cascade" }),
         languageCode: text("language_code").notNull().references(() => supportedLanguages.code, { onDelete: "restrict" }),
 
-        subject: varchar("subject", { length: 255 }),
-        htmlBody: text("html_body"),
-        textBody: text("text_body"),
+        // Translated templates for each channel
+        emailTemplate: jsonb("email_template"),
+        inAppTemplate: jsonb("in_app_template"),
+        chatTemplate: jsonb("chat_template"),
 
         // Localized variables and their descriptions
-        localizedVariables: jsonb("localized_variables"), // Variable names and descriptions in this language
+        localizedVariables: jsonb("localized_variables"),
 
         status: text("status").notNull().default("draft"), // draft, published, archived
-        translatedBy: text("translated_by").references(() => users.id, { onDelete: "set null" }), // Changed to text
-        reviewedBy: text("reviewed_by").references(() => users.id, { onDelete: "set null" }), // Changed to text
+        translatedBy: text("translated_by").references(() => users.id, { onDelete: "set null" }),
+        reviewedBy: text("reviewed_by").references(() => users.id, { onDelete: "set null" }),
 
         createdAt: timestamp("created_at").notNull().defaultNow(),
         updatedAt: timestamp("updated_at").notNull().defaultNow(),
     },
     (t) => ({
-        uqTemplateLanguage: uniqueIndex("email_template_translations_template_language_uq").on(t.templateId, t.languageCode),
-        idxLanguage: index("email_template_translations_language_idx").on(t.languageCode),
-        idxStatus: index("email_template_translations_status_idx").on(t.status),
+        uqTemplateLanguage: uniqueIndex("notification_template_translations_template_language_uq").on(t.templateId, t.languageCode),
+        idxLanguage: index("notification_template_translations_language_idx").on(t.languageCode),
+        idxStatus: index("notification_template_translations_status_idx").on(t.status),
     })
 );
 
@@ -484,11 +452,11 @@ export const emailTemplateTranslations = pgTable(
 export const automationRuleTranslations = pgTable(
     "automation_rule_translations",
     {
-        id: varchar("id", { length: 36 }).primaryKey().$defaultFn(() => crypto.randomUUID()),
-        ruleId: varchar("rule_id", { length: 36 }).notNull().references(() => automationRules.id, { onDelete: "cascade" }),
+        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
+        ruleId: text("rule_id").notNull().references(() => automationRules.id, { onDelete: "cascade" }),
         languageCode: text("language_code").notNull().references(() => supportedLanguages.code, { onDelete: "restrict" }),
 
-        name: varchar("name", { length: 255 }),
+        name: text("name"),
         description: text("description"),
 
         // Localized actions (e.g., notification messages, email content)
@@ -502,127 +470,79 @@ export const automationRuleTranslations = pgTable(
     })
 );
 
-/* ---------------- Localized Notification Queue ---------------- */
-export const localizedNotificationQueue = pgTable(
-    "localized_notification_queue",
-    {
-        id: varchar("id", { length: 36 }).primaryKey().$defaultFn(() => crypto.randomUUID()),
-        notificationId: varchar("notification_id", { length: 36 }).notNull().references(() => notificationQueue.id, { onDelete: "cascade" }),
-
-        languageCode: text("language_code").notNull().references(() => supportedLanguages.code, { onDelete: "restrict" }),
-
-        // Localized content
-        localizedSubject: varchar("localized_subject", { length: 255 }),
-        localizedMessage: text("localized_message"),
-        localizedTemplateData: jsonb("localized_template_data"),
-
-        // Regional delivery preferences
-        timezoneAdjusted: boolean("timezone_adjusted").default(true),
-        culturalSensitivityCheck: boolean("cultural_sensitivity_check").default(false),
-
-        createdAt: timestamp("created_at").notNull().defaultNow(),
-    },
-    (t) => ({
-        uqNotificationLanguage: uniqueIndex("localized_notification_queue_notification_language_uq").on(t.notificationId, t.languageCode),
-        idxLanguage: index("localized_notification_queue_language_idx").on(t.languageCode),
-    })
-);
-
-/* ---------------- Relations (Grouped at Bottom) ---------------- */
+/* ---------------- Relations ---------------- */
 export const workflowsRelations = relations(workflows, ({ one, many }) => ({
-    owner: one(users, { fields: [workflows.userId], references: [users.id] }), // Updated to users
+    owner: one(users, { fields: [workflows.userId], references: [users.id] }),
+    organization: one(organizations, { fields: [workflows.organizationId], references: [organizations.id] }),
+    team: one(teams, { fields: [workflows.teamId], references: [teams.id] }),
     form: one(forms, { fields: [workflows.formId], references: [forms.id] }),
-    eventType: one(eventTypes, {
-        fields: [workflows.eventTypeId],
-        references: [eventTypes.id],
-    }),
+    eventType: one(eventTypes, { fields: [workflows.eventTypeId], references: [eventTypes.id] }),
+    novuWorkflow: one(novuWorkflows, { fields: [workflows.novuWorkflowId], references: [novuWorkflows.id] }),
     executions: many(workflowExecutions),
+    defaultLanguageRef: one(supportedLanguages, { fields: [workflows.defaultLanguage], references: [supportedLanguages.code] }),
 }));
 
-export const workflowExecutionsRelations = relations(
-    workflowExecutions,
-    ({ one }) => ({
-        workflow: one(workflows, {
-            fields: [workflowExecutions.workflowId],
-            references: [workflows.id],
-        }),
-    }),
-);
+export const workflowExecutionsRelations = relations(workflowExecutions, ({ one }) => ({
+    workflow: one(workflows, { fields: [workflowExecutions.workflowId], references: [workflows.id] }),
+    organization: one(organizations, { fields: [workflowExecutions.organizationId], references: [organizations.id] }),
+    novuTrigger: one(novuTriggers, { fields: [workflowExecutions.novuTriggerId], references: [novuTriggers.id] }),
+}));
 
 export const integrationsRelations = relations(integrations, ({ one }) => ({
-    owner: one(users, { fields: [integrations.userId], references: [users.id] }), // Updated to users
+    owner: one(users, { fields: [integrations.userId], references: [users.id] }),
+    organization: one(organizations, { fields: [integrations.organizationId], references: [organizations.id] }),
 }));
 
 export const webhooksRelations = relations(webhooks, ({ one, many }) => ({
-    owner: one(users, { fields: [webhooks.userId], references: [users.id] }), // Updated to users
+    owner: one(users, { fields: [webhooks.userId], references: [users.id] }),
+    organization: one(organizations, { fields: [webhooks.organizationId], references: [organizations.id] }),
     form: one(forms, { fields: [webhooks.formId], references: [forms.id] }),
-    eventType: one(eventTypes, {
-        fields: [webhooks.eventTypeId],
-        references: [eventTypes.id],
-    }),
+    eventType: one(eventTypes, { fields: [webhooks.eventTypeId], references: [eventTypes.id] }),
     deliveries: many(webhookDeliveries),
 }));
 
-export const webhookDeliveriesRelations = relations(
-    webhookDeliveries,
-    ({ one }) => ({
-        webhook: one(webhooks, {
-            fields: [webhookDeliveries.webhookId],
-            references: [webhooks.id],
-        }),
-    }),
-);
-
-export const emailTemplatesRelations = relations(emailTemplates, ({ one, many }) => ({
-    owner: one(users, { fields: [emailTemplates.userId], references: [users.id] }), // Updated to users
-    translations: many(emailTemplateTranslations),
-    defaultLanguageRef: one(supportedLanguages, {
-        fields: [emailTemplates.defaultLanguage],
-        references: [supportedLanguages.code],
-    }),
+export const webhookDeliveriesRelations = relations(webhookDeliveries, ({ one }) => ({
+    webhook: one(webhooks, { fields: [webhookDeliveries.webhookId], references: [webhooks.id] }),
+    organization: one(organizations, { fields: [webhookDeliveries.organizationId], references: [organizations.id] }),
 }));
 
-export const notificationQueueRelations = relations(
-    notificationQueue,
-    ({ one }) => ({
-        owner: one(users, { // Updated to users
-            fields: [notificationQueue.userId],
-            references: [users.id],
-        }),
-    }),
-);
-
-export const aiInsightsRelations = relations(aiInsights, ({ one }) => ({
-    owner: one(users, { fields: [aiInsights.userId], references: [users.id] }), // Updated to users
+export const notificationTemplatesRelations = relations(notificationTemplates, ({ one, many }) => ({
+    owner: one(users, { fields: [notificationTemplates.userId], references: [users.id] }),
+    organization: one(organizations, { fields: [notificationTemplates.organizationId], references: [organizations.id] }),
+    novuWorkflow: one(novuWorkflows, { fields: [notificationTemplates.novuWorkflowId], references: [novuWorkflows.id] }),
+    translations: many(notificationTemplateTranslations),
+    defaultLanguageRef: one(supportedLanguages, { fields: [notificationTemplates.defaultLanguage], references: [supportedLanguages.code] }),
 }));
 
-export const automationRulesRelations = relations(
-    automationRules,
-    ({ one }) => ({
-        owner: one(users, { fields: [automationRules.userId], references: [users.id] }), // Updated to users
-        form: one(forms, { fields: [automationRules.formId], references: [forms.id] }),
-        eventType: one(eventTypes, {
-            fields: [automationRules.eventTypeId],
-            references: [eventTypes.id],
-        }),
-    }),
-);
+export const notificationQueueRelations = relations(notificationQueue, ({ one }) => ({
+    owner: one(users, { fields: [notificationQueue.userId], references: [users.id] }),
+    organization: one(organizations, { fields: [notificationQueue.organizationId], references: [organizations.id] }),
+    template: one(notificationTemplates, { fields: [notificationQueue.templateId], references: [notificationTemplates.id] }),
+}));
 
-export const emailTemplateTranslationsRelations = relations(emailTemplateTranslations, ({ one }) => ({
-    template: one(emailTemplates, {
-        fields: [emailTemplateTranslations.templateId],
-        references: [emailTemplates.id]
+export const automationRulesRelations = relations(automationRules, ({ one, many }) => ({
+    owner: one(users, { fields: [automationRules.userId], references: [users.id] }),
+    organization: one(organizations, { fields: [automationRules.organizationId], references: [organizations.id] }),
+    form: one(forms, { fields: [automationRules.formId], references: [forms.id] }),
+    eventType: one(eventTypes, { fields: [automationRules.eventTypeId], references: [eventTypes.id] }),
+    translations: many(automationRuleTranslations),
+}));
+
+export const notificationTemplateTranslationsRelations = relations(notificationTemplateTranslations, ({ one }) => ({
+    template: one(notificationTemplates, {
+        fields: [notificationTemplateTranslations.templateId],
+        references: [notificationTemplates.id]
     }),
     language: one(supportedLanguages, {
-        fields: [emailTemplateTranslations.languageCode],
+        fields: [notificationTemplateTranslations.languageCode],
         references: [supportedLanguages.code]
     }),
-    translator: one(users, { // Updated to users
-        fields: [emailTemplateTranslations.translatedBy],
+    translator: one(users, {
+        fields: [notificationTemplateTranslations.translatedBy],
         references: [users.id]
     }),
-    reviewer: one(users, { // Updated to users
-        fields: [emailTemplateTranslations.reviewedBy],
+    reviewer: one(users, {
+        fields: [notificationTemplateTranslations.reviewedBy],
         references: [users.id]
     }),
 }));
@@ -634,17 +554,6 @@ export const automationRuleTranslationsRelations = relations(automationRuleTrans
     }),
     language: one(supportedLanguages, {
         fields: [automationRuleTranslations.languageCode],
-        references: [supportedLanguages.code]
-    }),
-}));
-
-export const localizedNotificationQueueRelations = relations(localizedNotificationQueue, ({ one }) => ({
-    notification: one(notificationQueue, {
-        fields: [localizedNotificationQueue.notificationId],
-        references: [notificationQueue.id]
-    }),
-    language: one(supportedLanguages, {
-        fields: [localizedNotificationQueue.languageCode],
         references: [supportedLanguages.code]
     }),
 }));

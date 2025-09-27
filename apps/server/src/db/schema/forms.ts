@@ -13,7 +13,6 @@ import {
 } from "drizzle-orm/pg-core";
 import { relations, sql } from "drizzle-orm";
 import { users, organizations } from "@/db/schema/auth";
-import { supportedLanguages } from "@/db/schema/localization";
 
 /* ---------------- Enums ---------------- */
 export const questionTypeEnum = pgEnum("question_type", [
@@ -43,17 +42,6 @@ export const formStatusEnum = pgEnum("form_status", [
     "published",
     "paused",
     "archived",
-]);
-
-export const logicOperatorEnum = pgEnum("logic_operator", [
-    "equals",
-    "not_equals",
-    "contains",
-    "not_contains",
-    "greater_than",
-    "less_than",
-    "is_empty",
-    "is_not_empty",
 ]);
 
 export const formTypeEnum = pgEnum("form_type", [
@@ -124,11 +112,6 @@ export const forms = pgTable(
         requireEmailVerification: boolean("require_email_verification").notNull().default(true),
         requirePhoneVerification: boolean("require_phone_verification").notNull().default(false),
         spamProtectionConfig: jsonb("spam_protection_config"),
-
-        // Localization
-        defaultLanguage: text("default_language").references(() => supportedLanguages.code, { onDelete: "set null" }),
-        availableLanguages: jsonb("available_languages"), // Array of language codes
-        autoDetectLanguage: boolean("auto_detect_language").notNull().default(true),
 
         // Access control for team members
         visibility: text("visibility").notNull().default("private"), // private, team, public

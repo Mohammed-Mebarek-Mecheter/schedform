@@ -1,4 +1,4 @@
-﻿// src/db/schema/workflows.ts
+﻿// src/db/schema/workflows.ts - SIMPLIFIED VERSION
 import {
     pgTable,
     text,
@@ -10,15 +10,18 @@ import {
     index,
     uniqueIndex,
 } from "drizzle-orm/pg-core";
-import { relations, sql } from "drizzle-orm";
+import {relations, sql} from "drizzle-orm";
 import { users, organizations, teams } from "@/db/schema/auth";
 import { forms } from "@/db/schema/forms";
 import { eventTypes } from "@/db/schema/scheduling";
-import { supportedLanguages } from "@/db/schema/localization";
 import { novuWorkflows, novuTriggers } from "@/db/schema/novu";
+import { calendarConnections, externalCalendarEvents } from "@/db/schema/calendar-core";
+import { videoConferenceConnections, videoMeetings, meetingParticipants } from "@/db/schema/video-conference-core";
+import { hubspotCrmConnections, hubspotContactMappings, hubspotCompanyMappings, hubspotDealMappings, hubspotMeetingMappings, hubspotWebhookEvents } from "@/db/schema/hubspot-crm-core";
 
 /* ---------------- Enums ---------------- */
 export const triggerTypeEnum = pgEnum("trigger_type", [
+    // Existing triggers
     "form_submitted",
     "form_started",
     "booking_created",
@@ -28,6 +31,50 @@ export const triggerTypeEnum = pgEnum("trigger_type", [
     "reminder_due",
     "no_show_detected",
     "scheduled_time",
+
+    // Calendar-specific triggers
+    "calendar_sync_completed",
+    "calendar_sync_failed",
+    "external_event_created",
+    "external_event_updated",
+    "external_event_deleted",
+    "availability_updated",
+    "conflict_detected",
+    "free_busy_updated",
+
+    // Video conference triggers
+    "video_meeting_created",
+    "video_meeting_started",
+    "video_meeting_ended",
+    "video_meeting_joined",
+    "video_meeting_left",
+    "recording_ready",
+    "transcript_available",
+    "participant_joined",
+    "participant_left",
+    "waiting_room_entered",
+
+    // HubSpot CRM triggers
+    "hubspot_contact_created",
+    "hubspot_contact_updated",
+    "hubspot_contact_deleted",
+    "hubspot_company_created",
+    "hubspot_company_updated",
+    "hubspot_deal_created",
+    "hubspot_deal_updated",
+    "hubspot_deal_stage_changed",
+    "hubspot_meeting_created",
+    "hubspot_meeting_updated",
+    "hubspot_sync_completed",
+    "hubspot_sync_failed",
+    "hubspot_webhook_received",
+    "hubspot_association_created",
+
+    // System triggers
+    "usage_limit_warning",
+    "plan_upgraded",
+    "integration_connected",
+    "system_alert"
 ]);
 
 export const workflowStatusEnum = pgEnum("workflow_status", [
@@ -46,16 +93,24 @@ export const executionStatusEnum = pgEnum("execution_status", [
     "retrying",
 ]);
 
+export const resourceTypeEnum = pgEnum("resource_type", [
+    "form",
+    "booking",
+    "calendar",
+    "video",
+    "hubspot",
+    "system",
+    "user"
+]);
+
 // Simplified integration types - most go through Novu now
 export const integrationTypeEnum = pgEnum("integration_type", [
     "zapier",
     "webhook",
-    "google_calendar",
-    "outlook_calendar",
-    "zoom",
-    "google_meet",
     "hubspot",
-    "novu", // New Novu integration type
+    "novu",
+    "crm",
+    "marketing"
 ]);
 
 /* ---------------- Workflows ---------------- */
@@ -71,32 +126,49 @@ export const workflows = pgTable(
         formId: text("form_id").references(() => forms.id, { onDelete: "cascade" }),
         eventTypeId: text("event_type_id").references(() => eventTypes.id, { onDelete: "cascade" }),
 
+        // Integration connections
+        calendarConnectionId: text("calendar_connection_id").references(() => calendarConnections.id, { onDelete: "set null" }),
+        videoConnectionId: text("video_connection_id").references(() => videoConferenceConnections.id, { onDelete: "set null" }),
+        hubspotConnectionId: text("hubspot_connection_id").references(() => hubspotCrmConnections.id, { onDelete: "set null" }),
+
         name: text("name").notNull(),
         description: text("description"),
         status: workflowStatusEnum("status").notNull().default("draft"),
 
+        // Enhanced trigger configuration
         triggerType: triggerTypeEnum("trigger_type").notNull(),
         triggerConfig: jsonb("trigger_config").notNull(),
         triggerConditions: jsonb("trigger_conditions"),
+
+        // Resource context for better targeting
+        resourceType: resourceTypeEnum("resource_type"),
+        resourceFilters: jsonb("resource_filters"),
+
+        // Workflow categorization
+        category: text("category").default("general"), // "calendar_automation", "video_followup", "hubspot_sync", "form_processing", "system_alert"
+        tags: jsonb("tags"), // Array of tags for filtering
 
         workflowDefinition: jsonb("workflow_definition").notNull(),
 
         // Novu integration
         novuWorkflowId: text("novu_workflow_id").references(() => novuWorkflows.id, { onDelete: "set null" }),
-        useNovu: boolean("use_novu").notNull().default(true), // Default to using Novu
+        useNovu: boolean("use_novu").notNull().default(true),
 
+        // Enhanced execution controls
         isActive: boolean("is_active").default(false),
         maxExecutionsPerDay: integer("max_executions_per_day"),
+        maxExecutionsPerHour: integer("max_executions_per_hour"),
         executionDelay: integer("execution_delay").default(0),
+
+        // Timezone and business hours awareness
+        timezoneAware: boolean("timezone_aware").default(true),
+        businessHoursOnly: boolean("business_hours_only").default(false),
+        businessHoursConfig: jsonb("business_hours_config"),
 
         totalExecutions: integer("total_executions").default(0),
         successfulExecutions: integer("successful_executions").default(0),
         failedExecutions: integer("failed_executions").default(0),
         lastExecutedAt: timestamp("last_executed_at"),
-
-        // Localization support
-        defaultLanguage: text("default_language").references(() => supportedLanguages.code, { onDelete: "set null" }),
-        supportedLanguages: jsonb("supported_languages"), // Array of language codes
 
         createdAt: timestamp("created_at").notNull().defaultNow(),
         updatedAt: timestamp("updated_at").notNull().defaultNow(),
@@ -107,11 +179,128 @@ export const workflows = pgTable(
         idxTeam: index("workflows_team_idx").on(t.teamId),
         idxNovuWorkflow: index("workflows_novu_workflow_idx").on(t.novuWorkflowId),
         idxActiveNovu: index("workflows_active_novu_idx").on(t.isActive, t.useNovu),
+        idxCategory: index("workflows_category_idx").on(t.category),
+        idxResourceType: index("workflows_resource_type_idx").on(t.resourceType),
+        idxCalendarConnection: index("workflows_calendar_connection_idx").on(t.calendarConnectionId).where(sql`${t.calendarConnectionId} IS NOT NULL`),
+        idxVideoConnection: index("workflows_video_connection_idx").on(t.videoConnectionId).where(sql`${t.videoConnectionId} IS NOT NULL`),
+        idxHubspotConnection: index("workflows_hubspot_connection_idx").on(t.hubspotConnectionId).where(sql`${t.hubspotConnectionId} IS NOT NULL`),
         uniqueNamePerOrg: uniqueIndex("workflows_org_name_idx").on(t.organizationId, t.name),
     }),
 );
 
-/* ---------------- Workflow Executions ---------------- */
+/* ---------------- Calendar-Specific Workflow Configurations ---------------- */
+export const calendarWorkflows = pgTable(
+    "calendar_workflows",
+    {
+        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
+        workflowId: text("workflow_id").notNull().references(() => workflows.id, { onDelete: "cascade" }),
+        calendarConnectionId: text("calendar_connection_id").notNull().references(() => calendarConnections.id, { onDelete: "cascade" }),
+        organizationId: text("organization_id").notNull().references(() => organizations.id, { onDelete: "cascade" }),
+
+        // Calendar-specific settings
+        eventTypes: jsonb("event_types"), // Which calendar events to monitor
+        watchCalendars: jsonb("watch_calendars"), // Specific calendar IDs to watch
+        syncDirections: jsonb("sync_directions"), // inbound, outbound, bidirectional
+
+        // Event matching criteria
+        titlePatterns: jsonb("title_patterns"),
+        organizerFilters: jsonb("organizer_filters"),
+        attendeeFilters: jsonb("attendee_filters"),
+        timeRangeFilters: jsonb("time_range_filters"),
+
+        // Conflict detection settings
+        monitorConflicts: boolean("monitor_conflicts").default(false),
+        conflictResolutionRules: jsonb("conflict_resolution_rules"),
+
+        // Availability monitoring
+        monitorAvailability: boolean("monitor_availability").default(false),
+        availabilityThresholds: jsonb("availability_thresholds"),
+
+        createdAt: timestamp("created_at").notNull().defaultNow(),
+        updatedAt: timestamp("updated_at").notNull().defaultNow(),
+    },
+    (t) => ({
+        uqWorkflowCalendar: uniqueIndex("calendar_workflows_workflow_calendar_uq").on(t.workflowId, t.calendarConnectionId),
+        idxOrganization: index("calendar_workflows_organization_idx").on(t.organizationId),
+        idxCalendarConnection: index("calendar_workflows_calendar_connection_idx").on(t.calendarConnectionId),
+    })
+);
+
+/* ---------------- Video Conference-Specific Workflow Configurations ---------------- */
+export const videoWorkflows = pgTable(
+    "video_workflows",
+    {
+        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
+        workflowId: text("workflow_id").notNull().references(() => workflows.id, { onDelete: "cascade" }),
+        videoConnectionId: text("video_connection_id").notNull().references(() => videoConferenceConnections.id, { onDelete: "cascade" }),
+        organizationId: text("organization_id").notNull().references(() => organizations.id, { onDelete: "cascade" }),
+
+        // Video-specific settings
+        meetingTypes: jsonb("meeting_types"), // which meeting types to monitor
+        participantThreshold: integer("participant_threshold"),
+        durationThresholds: jsonb("duration_thresholds"),
+
+        // Recording and transcript settings
+        watchRecordings: boolean("watch_recordings").default(false),
+        watchTranscripts: boolean("watch_transcripts").default(false),
+        recordingQualityThresholds: jsonb("recording_quality_thresholds"),
+
+        // Participant monitoring
+        monitorParticipants: boolean("monitor_participants").default(true),
+        participantRoleFilters: jsonb("participant_role_filters"), // host, co-host, attendee
+        participantLocationFilters: jsonb("participant_location_filters"),
+
+        // Engagement tracking
+        trackEngagement: boolean("track_engagement").default(false),
+        engagementThresholds: jsonb("engagement_thresholds"),
+
+        createdAt: timestamp("created_at").notNull().defaultNow(),
+        updatedAt: timestamp("updated_at").notNull().defaultNow(),
+    },
+    (t) => ({
+        uqWorkflowVideo: uniqueIndex("video_workflows_workflow_video_uq").on(t.workflowId, t.videoConnectionId),
+        idxOrganization: index("video_workflows_organization_idx").on(t.organizationId),
+        idxVideoConnection: index("video_workflows_video_connection_idx").on(t.videoConnectionId),
+    })
+);
+
+/* ---------------- HubSpot CRM-Specific Workflow Configurations ---------------- */
+export const hubspotWorkflows = pgTable(
+    "hubspot_workflows",
+    {
+        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
+        workflowId: text("workflow_id").notNull().references(() => workflows.id, { onDelete: "cascade" }),
+        hubspotConnectionId: text("hubspot_connection_id").notNull().references(() => hubspotCrmConnections.id, { onDelete: "cascade" }),
+        organizationId: text("organization_id").notNull().references(() => organizations.id, { onDelete: "cascade" }),
+
+        // HubSpot-specific settings
+        objectTypes: jsonb("object_types"), // Which HubSpot objects to monitor: ["contact", "company", "deal", "meeting"]
+        propertyChangeFilters: jsonb("property_change_filters"), // Specific properties to watch for changes
+        dealStageFilters: jsonb("deal_stage_filters"), // Which deal stages trigger workflows
+
+        // Association monitoring
+        monitorAssociations: boolean("monitor_associations").default(false),
+        associationTypes: jsonb("association_types"), // Which association types to monitor
+
+        // Webhook configuration
+        useRealTimeWebhooks: boolean("use_real_time_webhooks").default(true),
+        webhookEventTypes: jsonb("webhook_event_types"), // Specific webhook events to listen for
+
+        // Sync monitoring
+        monitorSyncOperations: boolean("monitor_sync_operations").default(false),
+        syncDirectionFilters: jsonb("sync_direction_filters"), // inbound, outbound, bidirectional
+
+        createdAt: timestamp("created_at").notNull().defaultNow(),
+        updatedAt: timestamp("updated_at").notNull().defaultNow(),
+    },
+    (t) => ({
+        uqWorkflowHubspot: uniqueIndex("hubspot_workflows_workflow_hubspot_uq").on(t.workflowId, t.hubspotConnectionId),
+        idxOrganization: index("hubspot_workflows_organization_idx").on(t.organizationId),
+        idxHubspotConnection: index("hubspot_workflows_hubspot_connection_idx").on(t.hubspotConnectionId),
+    })
+);
+
+/* ---------------- Workflow Executions - Enhanced with Resource Context ---------------- */
 export const workflowExecutions = pgTable(
     "workflow_executions",
     {
@@ -126,6 +315,25 @@ export const workflowExecutions = pgTable(
         triggeredBy: text("triggered_by").notNull(),
         triggerData: jsonb("trigger_data"),
 
+        // Enhanced resource context
+        resourceType: resourceTypeEnum("resource_type"),
+        resourceId: text("resource_id"),
+
+        // Specific resource references
+        calendarEventId: text("calendar_event_id").references(() => externalCalendarEvents.id, { onDelete: "set null" }),
+        videoMeetingId: text("video_meeting_id").references(() => videoMeetings.id, { onDelete: "set null" }),
+        participantId: text("participant_id").references(() => meetingParticipants.id, { onDelete: "set null" }),
+
+        // HubSpot resource references
+        hubspotContactMappingId: text("hubspot_contact_mapping_id").references(() => hubspotContactMappings.id, { onDelete: "set null" }),
+        hubspotDealMappingId: text("hubspot_deal_mapping_id").references(() => hubspotDealMappings.id, { onDelete: "set null" }),
+        hubspotCompanyMappingId: text("hubspot_company_mapping_id").references(() => hubspotCompanyMappings.id, { onDelete: "set null" }),
+        hubspotMeetingMappingId: text("hubspot_meeting_mapping_id").references(() => hubspotMeetingMappings.id, { onDelete: "set null" }),
+
+        // HubSpot-specific context
+        hubspotWebhookEventId: text("hubspot_webhook_event_id").references(() => hubspotWebhookEvents.id, { onDelete: "set null" }),
+        hubspotPropertyChanges: jsonb("hubspot_property_changes"), // Track which properties changed
+
         status: executionStatusEnum("status").notNull().default("pending"),
         currentStep: integer("current_step").default(0),
         totalSteps: integer("total_steps").notNull(),
@@ -135,12 +343,16 @@ export const workflowExecutions = pgTable(
         errorStep: integer("error_step"),
         retryCount: integer("retry_count").default(0),
 
+        // Timezone context
+        executionTimezone: text("execution_timezone"),
+        businessHoursRespected: boolean("business_hours_respected").default(false),
+
         startedAt: timestamp("started_at"),
         completedAt: timestamp("completed_at"),
         executionDuration: integer("execution_duration"),
 
         // Novu-specific tracking
-        novuTransactionId: text("novu_transaction_id"), // For tracking in Novu
+        novuTransactionId: text("novu_transaction_id"),
         novuExecutionResults: jsonb("novu_execution_results"),
 
         createdAt: timestamp("created_at").notNull().defaultNow(),
@@ -152,6 +364,13 @@ export const workflowExecutions = pgTable(
         idxStatus: index("workflow_executions_status_idx").on(t.status),
         idxNovuTrigger: index("workflow_executions_novu_trigger_idx").on(t.novuTriggerId),
         idxNovuTransaction: index("workflow_executions_novu_transaction_idx").on(t.novuTransactionId),
+        idxResource: index("workflow_executions_resource_idx").on(t.resourceType, t.resourceId),
+        idxCalendarEvent: index("workflow_executions_calendar_event_idx").on(t.calendarEventId).where(sql`${t.calendarEventId} IS NOT NULL`),
+        idxVideoMeeting: index("workflow_executions_video_meeting_idx").on(t.videoMeetingId).where(sql`${t.videoMeetingId} IS NOT NULL`),
+        idxHubspotContact: index("workflow_executions_hubspot_contact_idx").on(t.hubspotContactMappingId).where(sql`${t.hubspotContactMappingId} IS NOT NULL`),
+        idxHubspotDeal: index("workflow_executions_hubspot_deal_idx").on(t.hubspotDealMappingId).where(sql`${t.hubspotDealMappingId} IS NOT NULL`),
+        idxHubspotWebhook: index("workflow_executions_hubspot_webhook_idx").on(t.hubspotWebhookEventId).where(sql`${t.hubspotWebhookEventId} IS NOT NULL`),
+        idxStartedAt: index("workflow_executions_started_idx").on(t.startedAt),
     }),
 );
 
@@ -272,98 +491,6 @@ export const webhookDeliveries = pgTable(
     }),
 );
 
-/* ---------------- Notification Templates - Now focused on Novu templates ---------------- */
-export const notificationTemplates = pgTable(
-    "notification_templates",
-    {
-        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-
-        userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
-        organizationId: text("organization_id").notNull().references(() => organizations.id, { onDelete: "cascade" }),
-
-        name: text("name").notNull(),
-        description: text("description"),
-        templateType: text("template_type").notNull(), // "email", "in_app", "chat"
-
-        // Novu workflow reference
-        novuWorkflowId: text("novu_workflow_id").references(() => novuWorkflows.id, { onDelete: "set null" }),
-
-        // Template content for different channels
-        emailTemplate: jsonb("email_template"), // { subject, body, variables }
-        inAppTemplate: jsonb("in_app_template"), // { title, body, avatar, cta }
-        chatTemplate: jsonb("chat_template"), // { text, blocks, attachments }
-
-        defaultLanguage: text("default_language").references(() => supportedLanguages.code, { onDelete: "set null" }),
-        supportedLanguages: jsonb("supported_languages"), // Array of language codes
-        autoDetectLanguage: boolean("auto_detect_language").default(true),
-
-        variables: jsonb("variables"),
-
-        isDefault: boolean("is_default").default(false),
-        isActive: boolean("is_active").default(true),
-
-        totalSent: integer("total_sent").default(0),
-        lastUsed: timestamp("last_used"),
-
-        createdAt: timestamp("created_at").notNull().defaultNow(),
-        updatedAt: timestamp("updated_at").notNull().defaultNow(),
-    },
-    (t) => ({
-        idxUser: index("notification_templates_user_idx").on(t.userId),
-        idxOrganization: index("notification_templates_organization_idx").on(t.organizationId),
-        idxType: index("notification_templates_type_idx").on(t.templateType),
-        idxNovuWorkflow: index("notification_templates_novu_workflow_idx").on(t.novuWorkflowId),
-        uniqueOrgName: uniqueIndex("notification_templates_org_name_idx").on(t.organizationId, t.name),
-    }),
-);
-
-/* ---------------- Notification Queue - Now routing through Novu ---------------- */
-export const notificationQueue = pgTable(
-    "notification_queue",
-    {
-        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-
-        userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
-        organizationId: text("organization_id").notNull().references(() => organizations.id, { onDelete: "cascade" }),
-
-        // Notification details
-        type: text("type").notNull(), // email, in_app, chat
-        recipient: text("recipient").notNull(),
-        subject: text("subject"),
-        message: text("message").notNull(),
-
-        templateId: text("template_id").references(() => notificationTemplates.id, { onDelete: "set null" }),
-        templateData: jsonb("template_data"),
-
-        // Novu-specific fields
-        novuWorkflowId: text("novu_workflow_id"),
-        novuTransactionId: text("novu_transaction_id"),
-        routeThroughNovu: boolean("route_through_novu").notNull().default(true),
-
-        scheduledFor: timestamp("scheduled_for"),
-        priority: integer("priority").default(5),
-
-        status: text("status").default("pending"),
-        attempts: integer("attempts").default(0),
-        maxAttempts: integer("max_attempts").default(3),
-        lastAttemptAt: timestamp("last_attempt_at"),
-        lastError: text("last_error"),
-
-        externalId: text("external_id"), // Novu message ID
-        deliveryStatus: text("delivery_status"),
-
-        createdAt: timestamp("created_at").notNull().defaultNow(),
-        processedAt: timestamp("processed_at"),
-    },
-    (t) => ({
-        idxUser: index("notification_queue_user_idx").on(t.userId),
-        idxOrganization: index("notification_queue_organization_idx").on(t.organizationId),
-        idxStatus: index("notification_queue_status_idx").on(t.status),
-        idxNovuWorkflow: index("notification_queue_novu_workflow_idx").on(t.novuWorkflowId),
-        idxScheduled: index("notification_queue_scheduled_idx").on(t.scheduledFor),
-    }),
-);
-
 /* ---------------- Automation Rules - Updated for Novu ---------------- */
 export const automationRules = pgTable(
     "automation_rules",
@@ -404,58 +531,6 @@ export const automationRules = pgTable(
     }),
 );
 
-/* ---------------- Template Translations ---------------- */
-export const notificationTemplateTranslations = pgTable(
-    "notification_template_translations",
-    {
-        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        templateId: text("template_id").notNull().references(() => notificationTemplates.id, { onDelete: "cascade" }),
-        languageCode: text("language_code").notNull().references(() => supportedLanguages.code, { onDelete: "restrict" }),
-
-        // Translated templates for each channel
-        emailTemplate: jsonb("email_template"),
-        inAppTemplate: jsonb("in_app_template"),
-        chatTemplate: jsonb("chat_template"),
-
-        // Localized variables and their descriptions
-        localizedVariables: jsonb("localized_variables"),
-
-        status: text("status").notNull().default("draft"), // draft, published, archived
-        translatedBy: text("translated_by").references(() => users.id, { onDelete: "set null" }),
-        reviewedBy: text("reviewed_by").references(() => users.id, { onDelete: "set null" }),
-
-        createdAt: timestamp("created_at").notNull().defaultNow(),
-        updatedAt: timestamp("updated_at").notNull().defaultNow(),
-    },
-    (t) => ({
-        uqTemplateLanguage: uniqueIndex("notification_template_translations_template_language_uq").on(t.templateId, t.languageCode),
-        idxLanguage: index("notification_template_translations_language_idx").on(t.languageCode),
-        idxStatus: index("notification_template_translations_status_idx").on(t.status),
-    })
-);
-
-/* ---------------- Automation Rule Translations ---------------- */
-export const automationRuleTranslations = pgTable(
-    "automation_rule_translations",
-    {
-        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        ruleId: text("rule_id").notNull().references(() => automationRules.id, { onDelete: "cascade" }),
-        languageCode: text("language_code").notNull().references(() => supportedLanguages.code, { onDelete: "restrict" }),
-
-        name: text("name"),
-        description: text("description"),
-
-        // Localized actions (e.g., notification messages, email content)
-        localizedActions: jsonb("localized_actions"),
-
-        createdAt: timestamp("created_at").notNull().defaultNow(),
-        updatedAt: timestamp("updated_at").notNull().defaultNow(),
-    },
-    (t) => ({
-        uqRuleLanguage: uniqueIndex("automation_rule_translations_rule_language_uq").on(t.ruleId, t.languageCode),
-    })
-);
-
 /* ---------------- Relations ---------------- */
 export const workflowsRelations = relations(workflows, ({ one, many }) => ({
     owner: one(users, { fields: [workflows.userId], references: [users.id] }),
@@ -463,15 +538,46 @@ export const workflowsRelations = relations(workflows, ({ one, many }) => ({
     team: one(teams, { fields: [workflows.teamId], references: [teams.id] }),
     form: one(forms, { fields: [workflows.formId], references: [forms.id] }),
     eventType: one(eventTypes, { fields: [workflows.eventTypeId], references: [eventTypes.id] }),
+    calendarConnection: one(calendarConnections, { fields: [workflows.calendarConnectionId], references: [calendarConnections.id] }),
+    videoConnection: one(videoConferenceConnections, { fields: [workflows.videoConnectionId], references: [videoConferenceConnections.id] }),
+    hubspotConnection: one(hubspotCrmConnections, { fields: [workflows.hubspotConnectionId], references: [hubspotCrmConnections.id] }),
     novuWorkflow: one(novuWorkflows, { fields: [workflows.novuWorkflowId], references: [novuWorkflows.id] }),
     executions: many(workflowExecutions),
-    defaultLanguageRef: one(supportedLanguages, { fields: [workflows.defaultLanguage], references: [supportedLanguages.code] }),
+    calendarWorkflows: many(calendarWorkflows),
+    videoWorkflows: many(videoWorkflows),
+    hubspotWorkflows: many(hubspotWorkflows),
+}));
+
+export const calendarWorkflowsRelations = relations(calendarWorkflows, ({ one }) => ({
+    workflow: one(workflows, { fields: [calendarWorkflows.workflowId], references: [workflows.id] }),
+    calendarConnection: one(calendarConnections, { fields: [calendarWorkflows.calendarConnectionId], references: [calendarConnections.id] }),
+    organization: one(organizations, { fields: [calendarWorkflows.organizationId], references: [organizations.id] }),
+}));
+
+export const videoWorkflowsRelations = relations(videoWorkflows, ({ one }) => ({
+    workflow: one(workflows, { fields: [videoWorkflows.workflowId], references: [workflows.id] }),
+    videoConnection: one(videoConferenceConnections, { fields: [videoWorkflows.videoConnectionId], references: [videoConferenceConnections.id] }),
+    organization: one(organizations, { fields: [videoWorkflows.organizationId], references: [organizations.id] }),
+}));
+
+export const hubspotWorkflowsRelations = relations(hubspotWorkflows, ({ one }) => ({
+    workflow: one(workflows, { fields: [hubspotWorkflows.workflowId], references: [workflows.id] }),
+    hubspotConnection: one(hubspotCrmConnections, { fields: [hubspotWorkflows.hubspotConnectionId], references: [hubspotCrmConnections.id] }),
+    organization: one(organizations, { fields: [hubspotWorkflows.organizationId], references: [organizations.id] }),
 }));
 
 export const workflowExecutionsRelations = relations(workflowExecutions, ({ one }) => ({
     workflow: one(workflows, { fields: [workflowExecutions.workflowId], references: [workflows.id] }),
     organization: one(organizations, { fields: [workflowExecutions.organizationId], references: [organizations.id] }),
     novuTrigger: one(novuTriggers, { fields: [workflowExecutions.novuTriggerId], references: [novuTriggers.id] }),
+    calendarEvent: one(externalCalendarEvents, { fields: [workflowExecutions.calendarEventId], references: [externalCalendarEvents.id] }),
+    videoMeeting: one(videoMeetings, { fields: [workflowExecutions.videoMeetingId], references: [videoMeetings.id] }),
+    participant: one(meetingParticipants, { fields: [workflowExecutions.participantId], references: [meetingParticipants.id] }),
+    hubspotContactMapping: one(hubspotContactMappings, { fields: [workflowExecutions.hubspotContactMappingId], references: [hubspotContactMappings.id] }),
+    hubspotCompanyMapping: one(hubspotCompanyMappings, { fields: [workflowExecutions.hubspotCompanyMappingId], references: [hubspotCompanyMappings.id] }),
+    hubspotDealMapping: one(hubspotDealMappings, { fields: [workflowExecutions.hubspotDealMappingId], references: [hubspotDealMappings.id] }),
+    hubspotMeetingMapping: one(hubspotMeetingMappings, { fields: [workflowExecutions.hubspotMeetingMappingId], references: [hubspotMeetingMappings.id] }),
+    hubspotWebhookEvent: one(hubspotWebhookEvents, { fields: [workflowExecutions.hubspotWebhookEventId], references: [hubspotWebhookEvents.id] }),
 }));
 
 export const integrationsRelations = relations(integrations, ({ one }) => ({
@@ -492,54 +598,9 @@ export const webhookDeliveriesRelations = relations(webhookDeliveries, ({ one })
     organization: one(organizations, { fields: [webhookDeliveries.organizationId], references: [organizations.id] }),
 }));
 
-export const notificationTemplatesRelations = relations(notificationTemplates, ({ one, many }) => ({
-    owner: one(users, { fields: [notificationTemplates.userId], references: [users.id] }),
-    organization: one(organizations, { fields: [notificationTemplates.organizationId], references: [organizations.id] }),
-    novuWorkflow: one(novuWorkflows, { fields: [notificationTemplates.novuWorkflowId], references: [novuWorkflows.id] }),
-    translations: many(notificationTemplateTranslations),
-    defaultLanguageRef: one(supportedLanguages, { fields: [notificationTemplates.defaultLanguage], references: [supportedLanguages.code] }),
-}));
-
-export const notificationQueueRelations = relations(notificationQueue, ({ one }) => ({
-    owner: one(users, { fields: [notificationQueue.userId], references: [users.id] }),
-    organization: one(organizations, { fields: [notificationQueue.organizationId], references: [organizations.id] }),
-    template: one(notificationTemplates, { fields: [notificationQueue.templateId], references: [notificationTemplates.id] }),
-}));
-
-export const automationRulesRelations = relations(automationRules, ({ one, many }) => ({
+export const automationRulesRelations = relations(automationRules, ({ one }) => ({
     owner: one(users, { fields: [automationRules.userId], references: [users.id] }),
     organization: one(organizations, { fields: [automationRules.organizationId], references: [organizations.id] }),
     form: one(forms, { fields: [automationRules.formId], references: [forms.id] }),
     eventType: one(eventTypes, { fields: [automationRules.eventTypeId], references: [eventTypes.id] }),
-    translations: many(automationRuleTranslations),
-}));
-
-export const notificationTemplateTranslationsRelations = relations(notificationTemplateTranslations, ({ one }) => ({
-    template: one(notificationTemplates, {
-        fields: [notificationTemplateTranslations.templateId],
-        references: [notificationTemplates.id]
-    }),
-    language: one(supportedLanguages, {
-        fields: [notificationTemplateTranslations.languageCode],
-        references: [supportedLanguages.code]
-    }),
-    translator: one(users, {
-        fields: [notificationTemplateTranslations.translatedBy],
-        references: [users.id]
-    }),
-    reviewer: one(users, {
-        fields: [notificationTemplateTranslations.reviewedBy],
-        references: [users.id]
-    }),
-}));
-
-export const automationRuleTranslationsRelations = relations(automationRuleTranslations, ({ one }) => ({
-    rule: one(automationRules, {
-        fields: [automationRuleTranslations.ruleId],
-        references: [automationRules.id]
-    }),
-    language: one(supportedLanguages, {
-        fields: [automationRuleTranslations.languageCode],
-        references: [supportedLanguages.code]
-    }),
 }));

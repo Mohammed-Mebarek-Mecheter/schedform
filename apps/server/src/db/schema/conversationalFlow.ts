@@ -15,7 +15,6 @@ import { relations, sql } from "drizzle-orm";
 import { formResponses, forms } from "@/db/schema/forms";
 import { bookings, eventTypes } from "@/db/schema/scheduling";
 import { users, organizations } from "@/db/schema/auth";
-import { supportedLanguages, translationStatusEnum } from "@/db/schema/localization";
 
 /**
  * Enums for conversational flow states
@@ -119,7 +118,7 @@ export const conversationalFlows = pgTable(
         requiresApproval: boolean("requires_approval").notNull().default(false),
         approvalRequiredReason: text("approval_required_reason"),
         approvedBy: text("approved_by")
-            .references(() => users.id, { onDelete: "set null" }), // Updated reference
+            .references(() => users.id, { onDelete: "set null" }),
         approvedAt: timestamp("approved_at", { mode: "date" }),
 
         // Email verification for high-value bookings
@@ -147,23 +146,6 @@ export const conversationalFlows = pgTable(
         completionPercentage: real("completion_percentage").notNull().default(0),
         timeToQualify: integer("time_to_qualify"),
         timeToBook: integer("time_to_book"),
-
-        detectedLanguage: text("detected_language").references(() => supportedLanguages.code, { onDelete: "set null" }),
-        preferredLanguage: text("preferred_language").references(() => supportedLanguages.code, { onDelete: "set null" }),
-
-        // Browser and regional context
-        acceptLanguageHeader: text("accept_language_header"),
-        detectedCountry: text("detected_country"),
-        detectedRegion: text("detected_region"),
-
-        // Localized AI analysis
-        localizedProspectSummary: jsonb("localized_prospect_summary"), // AI summary in detected language
-        localizedKeyInsights: jsonb("localized_key_insights"),
-        localizedMeetingRecommendations: jsonb("localized_meeting_recommendations"),
-
-        // Cultural context for better AI analysis
-        culturalContext: jsonb("cultural_context"), // Regional business practices, communication styles
-        preferredCommunicationStyle: text("preferred_communication_style"), // formal, casual, etc.
 
         // Plan-specific limits tracking
         planType: text("plan_type").default("free"), // free, starter, professional, business
@@ -403,194 +385,6 @@ export const schedulingRecommendations = pgTable(
     })
 );
 
-/* ---------------- Flow Event Translations ---------------- */
-export const flowEventTranslations = pgTable(
-    "flow_event_translations",
-    {
-        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        eventId: text("event_id").notNull().references(() => flowEvents.id, { onDelete: "cascade" }),
-        languageCode: text("language_code").notNull().references(() => supportedLanguages.code, { onDelete: "restrict" }),
-
-        // Localized event descriptions
-        localizedEventType: text("localized_event_type"), // Human-readable event type in local language
-        localizedDescription: text("localized_description"),
-        localizedEventData: jsonb("localized_event_data"), // Event data with translated strings
-
-        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
-    },
-    (t) => ({
-        uqEventLanguage: uniqueIndex("flow_event_translations_event_language_uq").on(t.eventId, t.languageCode),
-        idxLanguage: index("flow_event_translations_language_idx").on(t.languageCode),
-    })
-);
-
-/* ---------------- AI Analysis Session Translations ---------------- */
-export const aiAnalysisTranslations = pgTable(
-    "ai_analysis_translations",
-    {
-        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        analysisSessionId: text("analysis_session_id").notNull().references(() => aiAnalysisSessions.id, { onDelete: "cascade" }),
-        languageCode: text("language_code").notNull().references(() => supportedLanguages.code, { onDelete: "restrict" }),
-
-        // Localized AI analysis results
-        localizedPromptTemplate: text("localized_prompt_template"), // Prompt in target language
-        localizedRawResponse: text("localized_raw_response"), // AI response in target language
-        localizedParsedResults: jsonb("localized_parsed_results"), // Structured results in target language
-
-        // Analysis metadata
-        languageModelUsed: text("language_model_used"), // Which model was used for this language
-        translationMethod: text("translation_method"), // "native", "translated", "hybrid"
-        translationQuality: real("translation_quality"), // 0-1 confidence score
-
-        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
-    },
-    (t) => ({
-        uqAnalysisLanguage: uniqueIndex("ai_analysis_translations_analysis_language_uq").on(t.analysisSessionId, t.languageCode),
-        idxTranslationQuality: index("ai_analysis_translations_quality_idx").on(t.translationQuality),
-
-        chkTranslationQuality: sql`CHECK (${t.translationQuality} IS NULL OR (${t.translationQuality} >= 0 AND ${t.translationQuality} <= 1))`,
-    })
-);
-
-/* ---------------- Prospect Insights Translations ---------------- */
-export const prospectInsightTranslations = pgTable(
-    "prospect_insight_translations",
-    {
-        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        insightId: text("insight_id").notNull().references(() => prospectInsights.id, { onDelete: "cascade" }),
-        languageCode: text("language_code").notNull().references(() => supportedLanguages.code, { onDelete: "restrict" }),
-
-        // Localized insights
-        localizedNeedsAnalysis: text("localized_needs_analysis"),
-        localizedPrimaryPainPoint: text("localized_primary_pain_point"),
-        localizedCompanyBackground: text("localized_company_background"),
-        localizedMeetingStrategy: text("localized_meeting_strategy"),
-
-        // Localized structured data
-        localizedPainPoints: jsonb("localized_pain_points"),
-        localizedTalkingPoints: jsonb("localized_talking_points"),
-        localizedQuestionsToAsk: jsonb("localized_questions_to_ask"),
-        localizedPitfallsToAvoid: jsonb("localized_pitfalls_to_avoid"),
-
-        // Cultural adaptations
-        culturalAdaptations: jsonb("cultural_adaptations"), // Region-specific business insights
-        communicationPreferences: jsonb("communication_preferences"), // Preferred styles by culture
-
-        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
-        updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
-    },
-    (t) => ({
-        uqInsightLanguage: uniqueIndex("prospect_insight_translations_insight_language_uq").on(t.insightId, t.languageCode),
-    })
-);
-
-/* ---------------- Scheduling Recommendations Translations ---------------- */
-export const schedulingRecommendationTranslations = pgTable(
-    "scheduling_recommendation_translations",
-    {
-        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        recommendationId: text("recommendation_id").notNull().references(() => schedulingRecommendations.id, { onDelete: "cascade" }),
-        languageCode: text("language_code").notNull().references(() => supportedLanguages.code, { onDelete: "restrict" }),
-
-        // Localized recommendations
-        localizedReasonForType: text("localized_reason_for_type"),
-        localizedFollowUpStrategy: text("localized_follow_up_strategy"),
-        localizedNextStepsRecommendation: text("localized_next_steps_recommendation"),
-
-        // Localized structured recommendations
-        localizedTimeSlotReasons: jsonb("localized_time_slot_reasons"),
-        localizedPreparationTasks: jsonb("localized_preparation_tasks"),
-
-        // Cultural timing preferences
-        culturalTimingPreferences: jsonb("cultural_timing_preferences"), // Region-specific optimal times
-        localBusinessContext: jsonb("local_business_context"), // Local holidays, customs, etc.
-
-        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
-    },
-    (t) => ({
-        uqRecommendationLanguage: uniqueIndex("scheduling_recommendation_translations_rec_language_uq").on(t.recommendationId, t.languageCode),
-    })
-);
-
-/* ---------------- Language-Aware Flow Templates ---------------- */
-export const flowTemplates = pgTable(
-    "flow_templates",
-    {
-        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-
-        templateName: text("template_name").notNull(),
-        templateType: text("template_type").notNull(), // "qualification", "intake", "survey", "booking"
-        category: text("category"), // "sales", "consulting", "recruiting", etc.
-
-        // Multi-language support
-        defaultLanguage: text("default_language").notNull().references(() => supportedLanguages.code, { onDelete: "restrict" }),
-        supportedLanguages: jsonb("supported_languages"), // Array of supported language codes
-
-        // Template configuration
-        templateDefinition: jsonb("template_definition").notNull(), // Default template structure
-        requiredFields: jsonb("required_fields"), // Fields that must be present
-        optionalFields: jsonb("optional_fields"), // Fields that can be customized
-
-        // AI and automation settings
-        aiPromptTemplates: jsonb("ai_prompt_templates"), // Per-language AI prompts
-        automationRules: jsonb("automation_rules"), // Default automation for this template
-
-        // Usage and metadata
-        isPublic: boolean("is_public").notNull().default(false),
-        usageCount: integer("usage_count").notNull().default(0),
-        averageRating: real("average_rating").notNull().default(0),
-
-        createdBy: text("created_by").references(() => users.id, { onDelete: "set null" }), // Updated reference
-        organizationId: text("organization_id")
-            .notNull()
-            .references(() => organizations.id, { onDelete: "cascade" }),
-        isActive: boolean("is_active").notNull().default(true),
-
-        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
-        updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
-    },
-    (t) => ({
-        idxTemplateType: index("flow_templates_type_idx").on(t.templateType, t.category),
-        idxPublic: index("flow_templates_public_idx").on(t.isPublic, t.isActive),
-        idxUsage: index("flow_templates_usage_idx").on(t.usageCount, t.averageRating),
-        idxOrganization: index("flow_templates_organization_idx").on(t.organizationId),
-
-        chkUsageCount: sql`CHECK (${t.usageCount} >= 0)`,
-        chkAverageRating: sql`CHECK (${t.averageRating} >= 0 AND ${t.averageRating} <= 5)`,
-    })
-);
-
-/* ---------------- Flow Template Translations ---------------- */
-export const flowTemplateTranslations = pgTable(
-    "flow_template_translations",
-    {
-        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        templateId: text("template_id").notNull().references(() => flowTemplates.id, { onDelete: "cascade" }),
-        languageCode: text("language_code").notNull().references(() => supportedLanguages.code, { onDelete: "restrict" }),
-
-        // Localized template content
-        templateName: text("template_name"),
-        description: text("description"),
-        localizedTemplateDefinition: jsonb("localized_template_definition"), // Template with translated strings
-
-        // Localized AI prompts and automation
-        localizedAiPrompts: jsonb("localized_ai_prompts"),
-        localizedAutomationRules: jsonb("localized_automation_rules"),
-
-        // Translation metadata
-        status: translationStatusEnum("status").notNull().default("draft"),
-        translatedBy: text("translated_by").references(() => users.id, { onDelete: "set null" }), // Updated reference
-        reviewedBy: text("reviewed_by").references(() => users.id, { onDelete: "set null" }), // Updated reference
-
-        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
-        updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
-    },
-    (t) => ({
-        uqTemplateLanguage: uniqueIndex("flow_template_translations_template_language_uq").on(t.templateId, t.languageCode),
-        idxStatus: index("flow_template_translations_status_idx").on(t.status),
-    })
-);
-
 /**
  * Relations for the conversational flow tables
  */
@@ -599,7 +393,7 @@ export const conversationalFlowsRelations = relations(conversationalFlows, ({ on
     formResponse: one(formResponses, { fields: [conversationalFlows.formResponseId], references: [formResponses.id] }),
     eventType: one(eventTypes, { fields: [conversationalFlows.eventTypeId], references: [eventTypes.id] }),
     booking: one(bookings, { fields: [conversationalFlows.bookingId], references: [bookings.id] }),
-    approver: one(users, { fields: [conversationalFlows.approvedBy], references: [users.id] }), // Updated reference
+    approver: one(users, { fields: [conversationalFlows.approvedBy], references: [users.id] }),
     organization: one(organizations, { fields: [conversationalFlows.organizationId], references: [organizations.id] }),
 
     // Child tables
@@ -623,83 +417,4 @@ export const prospectInsightsRelations = relations(prospectInsights, ({ one }) =
 
 export const schedulingRecommendationsRelations = relations(schedulingRecommendations, ({ one }) => ({
     flow: one(conversationalFlows, { fields: [schedulingRecommendations.flowId], references: [conversationalFlows.id] }),
-}));
-
-export const flowEventTranslationsRelations = relations(flowEventTranslations, ({ one }) => ({
-    event: one(flowEvents, {
-        fields: [flowEventTranslations.eventId],
-        references: [flowEvents.id]
-    }),
-    language: one(supportedLanguages, {
-        fields: [flowEventTranslations.languageCode],
-        references: [supportedLanguages.code]
-    }),
-}));
-
-export const aiAnalysisTranslationsRelations = relations(aiAnalysisTranslations, ({ one }) => ({
-    analysisSession: one(aiAnalysisSessions, {
-        fields: [aiAnalysisTranslations.analysisSessionId],
-        references: [aiAnalysisSessions.id]
-    }),
-    language: one(supportedLanguages, {
-        fields: [aiAnalysisTranslations.languageCode],
-        references: [supportedLanguages.code]
-    }),
-}));
-
-export const prospectInsightTranslationsRelations = relations(prospectInsightTranslations, ({ one }) => ({
-    insight: one(prospectInsights, {
-        fields: [prospectInsightTranslations.insightId],
-        references: [prospectInsights.id]
-    }),
-    language: one(supportedLanguages, {
-        fields: [prospectInsightTranslations.languageCode],
-        references: [supportedLanguages.code]
-    }),
-}));
-
-export const schedulingRecommendationTranslationsRelations = relations(schedulingRecommendationTranslations, ({ one }) => ({
-    recommendation: one(schedulingRecommendations, {
-        fields: [schedulingRecommendationTranslations.recommendationId],
-        references: [schedulingRecommendations.id]
-    }),
-    language: one(supportedLanguages, {
-        fields: [schedulingRecommendationTranslations.languageCode],
-        references: [supportedLanguages.code]
-    }),
-}));
-
-export const flowTemplatesRelations = relations(flowTemplates, ({ one, many }) => ({
-    creator: one(users, {
-        fields: [flowTemplates.createdBy],
-        references: [users.id]
-    }),
-    organization: one(organizations, {
-        fields: [flowTemplates.organizationId],
-        references: [organizations.id]
-    }),
-    defaultLanguageRef: one(supportedLanguages, {
-        fields: [flowTemplates.defaultLanguage],
-        references: [supportedLanguages.code]
-    }),
-    translations: many(flowTemplateTranslations),
-}));
-
-export const flowTemplateTranslationsRelations = relations(flowTemplateTranslations, ({ one }) => ({
-    template: one(flowTemplates, {
-        fields: [flowTemplateTranslations.templateId],
-        references: [flowTemplates.id]
-    }),
-    translator: one(users, {
-        fields: [flowTemplateTranslations.translatedBy],
-        references: [users.id]
-    }),
-    reviewer: one(users, {
-        fields: [flowTemplateTranslations.reviewedBy],
-        references: [users.id]
-    }),
-    language: one(supportedLanguages, {
-        fields: [flowTemplateTranslations.languageCode],
-        references: [supportedLanguages.code]
-    }),
 }));

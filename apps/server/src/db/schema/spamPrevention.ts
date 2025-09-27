@@ -16,8 +16,7 @@ import { relations, sql } from "drizzle-orm";
 import { users, organizations, teams } from "@/db/schema/auth";
 import { formResponses, forms } from "@/db/schema/forms";
 import { bookings } from "@/db/schema/scheduling";
-import { supportedLanguages } from "@/db/schema/localization";
-import { novuWorkflows, novuTriggers, novuSubscribers } from "@/db/schema/novu";
+import {novuWorkflows, novuTriggers, novuSubscribers, novuMessages} from "@/db/schema/novu";
 
 /**
  * Enums for spam prevention and quality control
@@ -49,25 +48,6 @@ export const reviewStatusEnum = pgEnum("review_status", [
     "escalated",
     "auto_approved",
     "requires_human",
-]);
-pgEnum("fraud_indicator", [
-    "suspicious_email",
-    "disposable_email",
-    "vpn_usage",
-    "tor_usage",
-    "bot_behavior",
-    "fake_phone",
-    "duplicate_submission",
-    "high_risk_ip",
-    "suspicious_domain",
-    "velocity_abuse",
-    "pattern_matching",
-    "ml_detection",
-    "honeypot_triggered",
-    "captcha_failed",
-    "browser_inconsistency",
-    "timezone_mismatch",
-    "impossible_speed",
 ]);
 
 export const blockReasonEnum = pgEnum("block_reason", [
@@ -336,7 +316,7 @@ export const emailVerifications = pgTable(
 
         // Novu integration
         novuTriggerId: text("novu_trigger_id").references(() => novuTriggers.id, { onDelete: "set null" }),
-        novuMessageId: text("novu_message_id"),
+        novuMessageId: text("novu_message_id").references(() => novuMessages.id, { onDelete: "set null" }),
         novuWorkflowId: text("novu_workflow_id").references(() => novuWorkflows.id, { onDelete: "set null" }),
 
         email: text("email").notNull(),
@@ -378,17 +358,6 @@ export const emailVerifications = pgTable(
         emailServiceProvider: text("email_service_provider"),
         externalMessageId: text("external_message_id"),
         emailCost: real("email_cost"),
-
-        detectedLanguage: text("detected_language").references(() => supportedLanguages.code, { onDelete: "set null" }),
-        preferredLanguage: text("preferred_language").references(() => supportedLanguages.code, { onDelete: "set null" }),
-
-        // Localized verification content
-        localizedSubject: text("localized_subject"),
-        localizedMessage: text("localized_message"),
-        localizedInstructions: text("localized_instructions"),
-
-        // Cultural context for verification
-        culturalContext: jsonb("cultural_context"),
 
         createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
         updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
@@ -740,16 +709,6 @@ export const emailVerificationsRelations = relations(emailVerifications, ({ one 
         fields: [emailVerifications.novuWorkflowId],
         references: [novuWorkflows.id],
         relationName: "email_verification_novu_workflow"
-    }),
-    detectedLanguageRef: one(supportedLanguages, {
-        fields: [emailVerifications.detectedLanguage],
-        references: [supportedLanguages.code],
-        relationName: "email_verification_detected_language"
-    }),
-    preferredLanguageRef: one(supportedLanguages, {
-        fields: [emailVerifications.preferredLanguage],
-        references: [supportedLanguages.code],
-        relationName: "email_verification_preferred_language"
     }),
 }));
 

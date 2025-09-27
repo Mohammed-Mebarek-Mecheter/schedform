@@ -504,8 +504,7 @@ export const novuWebhookEvents = pgTable(
         signature: text("signature"),
         source: text("source").default("novu"),
 
-        // Associated notification with extended context
-        messageId: text("message_id").references(() => novuMessages.messageId, { onDelete: "set null" }),
+        novuMessageId: text("novu_message_id").references(() => novuMessages.id, { onDelete: "set null" }),
         transactionId: text("transaction_id"),
         resourceType: novuResourceTypeEnum("resource_type"), // Type of resource that triggered the webhook
 
@@ -717,8 +716,8 @@ export const novuWebhookEventsRelations = relations(novuWebhookEvents, ({ one })
         references: [organizations.id],
     }),
     message: one(novuMessages, {
-        fields: [novuWebhookEvents.messageId],
-        references: [novuMessages.messageId],
+        fields: [novuWebhookEvents.novuMessageId],
+        references: [novuMessages.id],
     }),
 }));
 

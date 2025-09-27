@@ -15,7 +15,6 @@ import {
 import { relations, sql } from "drizzle-orm";
 import { users, organizations, teams } from "@/db/schema/auth";
 import { formResponses, forms } from "@/db/schema/forms";
-import { eventTypeTranslations, supportedLanguages } from "@/db/schema/localization";
 import { calendarConnections } from "./calendar-core";
 import {videoMeetings} from "@/db/schema/video-conference-core";
 
@@ -25,7 +24,7 @@ import {videoMeetings} from "@/db/schema/video-conference-core";
 
 export const schedulingModeEnum = pgEnum("scheduling_mode", [
     "instant", // Direct booking from available slots
-    "curated", // AI suggests 2-3 optimal times via email
+    "curated", // AI suggests 2-3 optimal times via personalized email
     "approval", // Manual approval required
 ]);
 
@@ -81,12 +80,7 @@ export const eventTypes = pgTable(
         description: text("description"),
         slug: text("slug").notNull(),
         regionalSettings: jsonb("regional_settings"),
-        defaultLanguage: text("default_language").references(() => supportedLanguages.code, { onDelete: "set null" }),
-        supportedLanguages: jsonb("supported_languages"), // Array of language codes
-        autoDetectLanguage: boolean("auto_detect_language").notNull().default(true),
-        localizedConfirmationTemplates: jsonb("localized_confirmation_templates"), // Per language
-        localizedReminderTemplates: jsonb("localized_reminder_templates"),
-        localizedCancellationTemplates: jsonb("localized_cancellation_templates"),
+
         duration: integer("duration").notNull(),
         bufferTimeBefore: integer("buffer_time_before").notNull().default(0),
         bufferTimeAfter: integer("buffer_time_after").notNull().default(0),
@@ -136,7 +130,6 @@ export const eventTypes = pgTable(
         idxTeam: index("event_types_team_idx").on(t.teamId).where(sql`${t.teamId} IS NOT NULL`),
         idxForm: index("event_types_form_idx").on(t.formId).where(sql`${t.formId} IS NOT NULL`),
 
-        // âœ… move checks here
         chkDuration: sql`CHECK (${t.duration} > 0 AND ${t.duration} <= 1440)`,
         chkBufferBefore: sql`CHECK (${t.bufferTimeBefore} >= 0 AND ${t.bufferTimeBefore} <= 240)`,
         chkBufferAfter: sql`CHECK (${t.bufferTimeAfter} >= 0 AND ${t.bufferTimeAfter} <= 240)`,
@@ -397,20 +390,6 @@ export const bookings = pgTable(
         bookingDuration: integer("booking_duration"),
         conversionSource: text("conversion_source"),
 
-        detectedLanguage: text("detected_language").references(() => supportedLanguages.code, {
-            onDelete: "set null",
-        }),
-        preferredLanguage: text("preferred_language").references(() => supportedLanguages.code, {
-            onDelete: "set null",
-        }),
-
-        detectedTimezone: text("detected_timezone"),
-        preferredDateFormat: text("preferred_date_format"),
-        preferredTimeFormat: text("preferred_time_format"),
-
-        localizedMeetingDetails: jsonb("localized_meeting_details"),
-        localizedPreparationTips: jsonb("localized_preparation_tips"),
-
         assignedUserId: text("assigned_user_id").references(() => users.id, { onDelete: "set null" }),
         permissions: jsonb("permissions"),
         metadata: jsonb("metadata"),
@@ -443,62 +422,6 @@ export const bookings = pgTable(
         chkIntentScore: sql`CHECK (${t.intentScore} IS NULL OR (${t.intentScore} >= 1 AND ${t.intentScore} <= 100))`,
         chkPrice: sql`CHECK (${t.price} IS NULL OR ${t.price} >= 0)`,
         chkBookingDuration: sql`CHECK (${t.bookingDuration} IS NULL OR ${t.bookingDuration} > 0)`,
-    }),
-);
-
-/**
- * Booking reminders - simplified with organization context (EMAIL ONLY)
- */
-export const bookingReminders = pgTable(
-    "booking_reminders",
-    {
-        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        bookingId: text("booking_id")
-            .notNull()
-            .references(() => bookings.id, { onDelete: "cascade" }),
-        organizationId: text("organization_id")
-            .notNull()
-            .references(() => organizations.id, { onDelete: "cascade" }),
-
-        type: text("type").notNull().default("email"), // 'email' | 'push' (SMS removed)
-        triggerMinutes: integer("trigger_minutes").notNull(), // Minutes before meeting
-
-        // Configuration
-        reminderTemplate: text("reminder_template"),
-        customMessage: text("custom_message"),
-        includeQualificationSummary: boolean("include_qualification_summary")
-            .notNull()
-            .default(false),
-        includePreparationTips: boolean("include_preparation_tips")
-            .notNull()
-            .default(false),
-
-        status: reminderStatusEnum("status").notNull().default("pending"),
-        sentAt: timestamp("sent_at", { mode: "date" }),
-        deliveredAt: timestamp("delivered_at", { mode: "date" }),
-        failureReason: text("failure_reason"),
-
-        subject: text("subject"),
-        message: text("message"),
-
-        // Delivery tracking
-        externalId: text("external_id"),
-        deliveryStatus: text("delivery_status"),
-
-        metadata: jsonb("metadata"),
-        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
-    },
-    (t) => ({
-        idxBookingTrigger: index("booking_reminders_booking_trigger_idx").on(
-            t.bookingId,
-            t.triggerMinutes,
-        ),
-        idxOrganization: index("booking_reminders_organization_idx").on(t.organizationId),
-        idxStatusPending: index("booking_reminders_status_pending_idx")
-            .on(t.status, t.sentAt)
-            .where(sql`${t.status} = 'pending'`),
-        chkTriggerMinutes: sql`CHECK (${t.triggerMinutes} > 0)`,
-        chkType: sql`CHECK (${t.type} IN ('email', 'push'))`, // SMS removed
     }),
 );
 
@@ -721,120 +644,6 @@ export const bookingAnalytics = pgTable(
     }),
 );
 
-/* ---------------- Booking Reminder Translations ---------------- */
-export const bookingReminderTranslations = pgTable(
-    "booking_reminder_translations",
-    {
-        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        reminderId: text("reminder_id").notNull().references(() => bookingReminders.id, { onDelete: "cascade" }),
-        languageCode: text("language_code").notNull().references(() => supportedLanguages.code, { onDelete: "restrict" }),
-        organizationId: text("organization_id")
-            .notNull()
-            .references(() => organizations.id, { onDelete: "cascade" }),
-
-        // Localized reminder content
-        subject: text("subject"),
-        message: text("message"),
-        customMessage: text("custom_message"),
-
-        // Localized template reference
-        reminderTemplate: text("reminder_template"), // Reference to localized template
-
-        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
-        updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
-    },
-    (t) => ({
-        uqReminderLanguage: uniqueIndex("booking_reminder_translations_reminder_language_uq").on(t.reminderId, t.languageCode),
-        idxLanguage: index("booking_reminder_translations_language_idx").on(t.languageCode),
-        idxOrganization: index("booking_reminder_translations_organization_idx").on(t.organizationId),
-    })
-);
-
-/* ---------------- Localized Meeting Feedback ---------------- */
-export const meetingFeedbackTranslations = pgTable(
-    "meeting_feedback_translations",
-    {
-        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        feedbackId: text("feedback_id").notNull().references(() => meetingFeedback.id, { onDelete: "cascade" }),
-        languageCode: text("language_code").notNull().references(() => supportedLanguages.code, { onDelete: "restrict" }),
-        organizationId: text("organization_id")
-            .notNull()
-            .references(() => organizations.id, { onDelete: "cascade" }),
-
-        // Localized feedback content
-        notes: text("notes"),
-        nextSteps: text("next_steps"),
-        outcome: text("outcome"),
-
-        // AI-generated content in local language
-        aiMeetingSummary: text("ai_meeting_summary"),
-        aiNextStepsRecommendation: text("ai_next_steps_recommendation"),
-
-        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
-        updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
-    },
-    (t) => ({
-        uqFeedbackLanguage: uniqueIndex("meeting_feedback_translations_feedback_language_uq").on(t.feedbackId, t.languageCode),
-        idxOrganization: index("meeting_feedback_translations_organization_idx").on(t.organizationId),
-    })
-);
-
-/* ---------------- Localized Booking Status Messages ---------------- */
-export const bookingStatusMessages = pgTable(
-    "booking_status_messages",
-    {
-        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        organizationId: text("organization_id")
-            .notNull()
-            .references(() => organizations.id, { onDelete: "cascade" }),
-
-        statusKey: text("status_key").notNull(), // "confirmed", "cancelled", "no_show", etc.
-        languageCode: text("language_code").notNull().references(() => supportedLanguages.code, { onDelete: "restrict" }),
-
-        // Different message types for each status (EMAIL ONLY)
-        emailSubject: text("email_subject"),
-        emailBody: text("email_body"),
-        inAppMessage: text("in_app_message"),
-
-        // Context-specific variables
-        availableVariables: jsonb("available_variables"), // What variables can be used in this status
-
-        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
-        updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
-    },
-    (t) => ({
-        uqStatusLanguage: uniqueIndex("booking_status_messages_status_language_uq").on(t.statusKey, t.languageCode),
-        idxStatus: index("booking_status_messages_status_idx").on(t.statusKey),
-        idxLanguage: index("booking_status_messages_language_idx").on(t.languageCode),
-        idxOrganization: index("booking_status_messages_organization_idx").on(t.organizationId),
-    })
-);
-
-/* ---------------- Time Zone Translation Helpers ---------------- */
-export const timezoneTranslations = pgTable(
-    "timezone_translations",
-    {
-        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        organizationId: text("organization_id")
-            .references(() => organizations.id, { onDelete: "cascade" }),
-
-        timezoneId: text("timezone_id").notNull(), // "America/New_York", "Europe/London", etc.
-        languageCode: text("language_code").notNull().references(() => supportedLanguages.code, { onDelete: "restrict" }),
-
-        displayName: text("display_name").notNull(), // "Eastern Standard Time", "Hora del Este", etc.
-        shortName: text("short_name"), // "EST", "GMT", etc.
-        description: text("description"), // Human-friendly description
-
-        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
-    },
-    (t) => ({
-        uqTimezoneLanguage: uniqueIndex("timezone_translations_timezone_language_uq").on(t.timezoneId, t.languageCode),
-        idxTimezone: index("timezone_translations_timezone_idx").on(t.timezoneId),
-        idxLanguage: index("timezone_translations_language_idx").on(t.languageCode),
-        idxOrganization: index("timezone_translations_organization_idx").on(t.organizationId).where(sql`${t.organizationId} IS NOT NULL`),
-    })
-);
-
 /* ============================
    Relations (type-safe helpers)
    ============================ */
@@ -849,11 +658,6 @@ export const eventTypesRelations = relations(eventTypes, ({ one, many }) => ({
     bookings: many(bookings),
     analytics: many(bookingAnalytics),
     availabilityRules: many(availabilityRules),
-    translations: many(eventTypeTranslations),
-    defaultLanguageRef: one(supportedLanguages, {
-        fields: [eventTypes.defaultLanguage],
-        references: [supportedLanguages.code],
-    }),
 }));
 
 export const availabilitySlotsRelations = relations(availabilitySlots, ({ one }) => ({
@@ -891,20 +695,11 @@ export const bookingsRelations = relations(bookings, ({ one, many }) => ({
         references: [calendarConnections.id],
     }),
     assignedUser: one(users, { fields: [bookings.assignedUserId], references: [users.id] }),
-    reminders: many(bookingReminders),
     feedback: many(meetingFeedback),
     // Self-relation for reschedule tracking
     originalBooking: one(bookings, {
         fields: [bookings.originalBookingId],
         references: [bookings.id],
-    }),
-    detectedLanguageRef: one(supportedLanguages, {
-        fields: [bookings.detectedLanguage],
-        references: [supportedLanguages.code],
-    }),
-    preferredLanguageRef: one(supportedLanguages, {
-        fields: [bookings.preferredLanguage],
-        references: [supportedLanguages.code],
     }),
     videoMeeting: one(videoMeetings, {
         fields: [bookings.videoMeetingId],
@@ -912,17 +707,10 @@ export const bookingsRelations = relations(bookings, ({ one, many }) => ({
     }),
 }));
 
-export const bookingRemindersRelations = relations(bookingReminders, ({ one, many }) => ({
-    booking: one(bookings, { fields: [bookingReminders.bookingId], references: [bookings.id] }),
-    organization: one(organizations, { fields: [bookingReminders.organizationId], references: [organizations.id] }),
-    translations: many(bookingReminderTranslations),
-}));
-
-export const meetingFeedbackRelations = relations(meetingFeedback, ({ one, many }) => ({
+export const meetingFeedbackRelations = relations(meetingFeedback, ({ one }) => ({
     booking: one(bookings, { fields: [meetingFeedback.bookingId], references: [bookings.id] }),
     organization: one(organizations, { fields: [meetingFeedback.organizationId], references: [organizations.id] }),
     reviewerUser: one(users, { fields: [meetingFeedback.reviewerUserId], references: [users.id] }),
-    translations: many(meetingFeedbackTranslations),
 }));
 
 export const teamAssignmentsRelations = relations(teamAssignments, ({ one }) => ({
@@ -937,56 +725,4 @@ export const bookingAnalyticsRelations = relations(bookingAnalytics, ({ one }) =
     user: one(users, { fields: [bookingAnalytics.userId], references: [users.id] }),
     organization: one(organizations, { fields: [bookingAnalytics.organizationId], references: [organizations.id] }),
     team: one(teams, { fields: [bookingAnalytics.teamId], references: [teams.id] }),
-}));
-
-export const bookingReminderTranslationsRelations = relations(bookingReminderTranslations, ({ one }) => ({
-    reminder: one(bookingReminders, {
-        fields: [bookingReminderTranslations.reminderId],
-        references: [bookingReminders.id]
-    }),
-    language: one(supportedLanguages, {
-        fields: [bookingReminderTranslations.languageCode],
-        references: [supportedLanguages.code]
-    }),
-    organization: one(organizations, {
-        fields: [bookingReminderTranslations.organizationId],
-        references: [organizations.id]
-    }),
-}));
-
-export const meetingFeedbackTranslationsRelations = relations(meetingFeedbackTranslations, ({ one }) => ({
-    feedback: one(meetingFeedback, {
-        fields: [meetingFeedbackTranslations.feedbackId],
-        references: [meetingFeedback.id]
-    }),
-    language: one(supportedLanguages, {
-        fields: [meetingFeedbackTranslations.languageCode],
-        references: [supportedLanguages.code]
-    }),
-    organization: one(organizations, {
-        fields: [meetingFeedbackTranslations.organizationId],
-        references: [organizations.id]
-    }),
-}));
-
-export const bookingStatusMessagesRelations = relations(bookingStatusMessages, ({ one }) => ({
-    language: one(supportedLanguages, {
-        fields: [bookingStatusMessages.languageCode],
-        references: [supportedLanguages.code]
-    }),
-    organization: one(organizations, {
-        fields: [bookingStatusMessages.organizationId],
-        references: [organizations.id]
-    }),
-}));
-
-export const timezoneTranslationsRelations = relations(timezoneTranslations, ({ one }) => ({
-    language: one(supportedLanguages, {
-        fields: [timezoneTranslations.languageCode],
-        references: [supportedLanguages.code]
-    }),
-    organization: one(organizations, {
-        fields: [timezoneTranslations.organizationId],
-        references: [organizations.id]
-    }),
 }));

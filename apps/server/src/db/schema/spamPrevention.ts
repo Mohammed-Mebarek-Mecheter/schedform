@@ -17,6 +17,7 @@ import { users, organizations, teams } from "@/db/schema/auth";
 import { formResponses, forms } from "@/db/schema/forms";
 import { bookings } from "@/db/schema/scheduling";
 import { supportedLanguages } from "@/db/schema/localization";
+import { novuWorkflows, novuTriggers, novuSubscribers } from "@/db/schema/novu";
 
 /**
  * Enums for spam prevention and quality control
@@ -49,8 +50,7 @@ export const reviewStatusEnum = pgEnum("review_status", [
     "auto_approved",
     "requires_human",
 ]);
-
-export const fraudIndicatorEnum = pgEnum("fraud_indicator", [
+pgEnum("fraud_indicator", [
     "suspicious_email",
     "disposable_email",
     "vpn_usage",
@@ -90,8 +90,69 @@ export const verificationMethodEnum = pgEnum("verification_method", [
     "manual_review",
 ]);
 
+export const spamActionEnum = pgEnum("spam_action", [
+    "allow",
+    "block",
+    "require_verification",
+    "flag_for_review",
+    "throttle",
+    "challenge",
+]);
+
 /**
- * Spam Detection Rules - Configurable rules (simplified)
+ * Spam Detection Engine Configuration
+ */
+export const spamEngineConfig = pgTable(
+    "spam_engine_config",
+    {
+        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
+        organizationId: text("organization_id").references(() => organizations.id, { onDelete: "cascade" }),
+        userId: text("user_id").references(() => users.id, { onDelete: "cascade" }),
+
+        // Engine settings
+        engineVersion: text("engine_version").notNull().default("v1.0"),
+        isActive: boolean("is_active").notNull().default(true),
+        confidenceThreshold: real("confidence_threshold").notNull().default(0.8),
+        autoBlockThreshold: integer("auto_block_threshold").notNull().default(85),
+
+        // Performance settings
+        maxProcessingTime: integer("max_processing_time").notNull().default(100), // ms
+        cacheEnabled: boolean("cache_enabled").notNull().default(true),
+        cacheTtl: integer("cache_ttl").notNull().default(300), // seconds
+
+        // Integration settings
+        novuIntegrationEnabled: boolean("novu_integration_enabled").notNull().default(true),
+        novuWorkflowId: text("novu_workflow_id").references(() => novuWorkflows.id, { onDelete: "set null" }),
+        novuVerificationWorkflowId: text("novu_verification_workflow_id").references(() => novuWorkflows.id, { onDelete: "set null" }),
+
+        // Feature toggles
+        mlEnabled: boolean("ml_enabled").notNull().default(true),
+        reputationEnabled: boolean("reputation_enabled").notNull().default(true),
+        behavioralAnalysisEnabled: boolean("behavioral_analysis_enabled").notNull().default(true),
+        realTimeBlocking: boolean("real_time_blocking").notNull().default(true),
+
+        // Notification settings
+        adminAlertEnabled: boolean("admin_alert_enabled").notNull().default(true),
+        adminAlertThreshold: integer("admin_alert_threshold").notNull().default(75),
+        userNotificationEnabled: boolean("user_notification_enabled").notNull().default(true),
+
+        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
+        updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
+    },
+    (t) => ({
+        idxOrgActive: index("spam_engine_config_org_active_idx").on(t.organizationId, t.isActive),
+        uqOrgConfig: uniqueIndex("spam_engine_config_org_uq").on(t.organizationId).where(sql`${t.organizationId} IS NOT NULL`),
+
+        chkConfidenceThreshold: sql`CHECK (${t.confidenceThreshold} >= 0 AND ${t.confidenceThreshold} <= 1)`,
+        chkAutoBlockThreshold: sql`CHECK (${t.autoBlockThreshold} >= 0 AND ${t.autoBlockThreshold} <= 100)`,
+        chkMaxProcessingTime: sql`CHECK (${t.maxProcessingTime} > 0 AND ${t.maxProcessingTime} <= 5000)`,
+        chkCacheTtl: sql`CHECK (${t.cacheTtl} >= 0 AND ${t.cacheTtl} <= 3600)`,
+        chkAdminAlertThreshold: sql`CHECK (${t.adminAlertThreshold} >= 0 AND ${t.adminAlertThreshold} <= 100)`,
+    }),
+);
+
+/**
+ * Spam Detection Rules - Enhanced with Novu integration
  */
 export const spamDetectionRules = pgTable(
     "spam_detection_rules",
@@ -112,11 +173,19 @@ export const spamDetectionRules = pgTable(
         severity: integer("severity").notNull().default(5),
         confidence: real("confidence").notNull().default(0.8),
 
-        // Actions
+        // Primary action (our custom system)
+        primaryAction: spamActionEnum("primary_action").notNull().default("require_verification"),
         blockSubmission: boolean("block_submission").notNull().default(false),
         requireVerification: boolean("require_verification").notNull().default(true),
         flagForReview: boolean("flag_for_review").notNull().default(false),
+
+        // Novu integration actions
+        novuNotificationEnabled: boolean("novu_notification_enabled").notNull().default(false),
+        novuWorkflowId: text("novu_workflow_id").references(() => novuWorkflows.id, { onDelete: "set null" }),
+        novuNotificationTemplate: text("novu_notification_template"),
         notifyAdmin: boolean("notify_admin").notNull().default(false),
+        notifyUser: boolean("notify_user").notNull().default(false),
+
         scoreAdjustment: integer("score_adjustment").notNull().default(0),
 
         // Rate limiting
@@ -138,7 +207,6 @@ export const spamDetectionRules = pgTable(
         updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
     },
     (t) => ({
-        // Indexes
         idxActiveGlobal: index("spam_detection_rules_active_global_idx")
             .on(t.isActive, t.isGlobal)
             .where(sql`${t.isActive} = true`),
@@ -148,7 +216,6 @@ export const spamDetectionRules = pgTable(
         idxRuleType: index("spam_detection_rules_type_idx").on(t.ruleType, t.isActive),
         idxOrgActive: index("spam_detection_rules_org_active_idx").on(t.organizationId, t.isActive),
 
-        // Constraints
         chkSeverity: sql`CHECK (${t.severity} >= 1 AND ${t.severity} <= 10)`,
         chkConfidence: sql`CHECK (${t.confidence} >= 0 AND ${t.confidence} <= 1)`,
         chkScoreAdjustment: sql`CHECK (${t.scoreAdjustment} >= -100 AND ${t.scoreAdjustment} <= 100)`,
@@ -160,7 +227,7 @@ export const spamDetectionRules = pgTable(
 );
 
 /**
- * Spam Assessments - Detailed analysis (simplified)
+ * Spam Assessments - Enhanced with Novu integration tracking
  */
 export const spamAssessments = pgTable(
     "spam_assessments",
@@ -175,6 +242,7 @@ export const spamAssessments = pgTable(
         riskLevel: spamRiskLevelEnum("risk_level").notNull(),
         isSpam: boolean("is_spam").notNull().default(false),
         confidence: real("confidence").notNull(),
+        finalAction: spamActionEnum("final_action").notNull().default("allow"),
 
         // Detection results
         indicators: jsonb("indicators"),
@@ -200,6 +268,12 @@ export const spamAssessments = pgTable(
         ipReputationScore: integer("ip_reputation_score"),
         emailReputationScore: integer("email_reputation_score"),
 
+        // Novu integration tracking
+        novuTriggerId: text("novu_trigger_id").references(() => novuTriggers.id, { onDelete: "set null" }),
+        novuVerificationTriggerId: text("novu_verification_trigger_id").references(() => novuTriggers.id, { onDelete: "set null" }),
+        novuSubscriberId: text("novu_subscriber_id").references(() => novuSubscribers.id, { onDelete: "set null" }),
+        notificationStatus: text("notification_status").default("pending"),
+
         // Manual review
         requiresReview: boolean("requires_review").notNull().default(false),
         reviewStatus: reviewStatusEnum("review_status"),
@@ -218,23 +292,24 @@ export const spamAssessments = pgTable(
         // Verification triggered
         verificationRequired: boolean("verification_required").notNull().default(false),
         verificationMethods: jsonb("verification_methods"),
+        verificationStatus: verificationStatusEnum("verification_status").default("not_required"),
 
         // Processing performance
         processingTime: integer("processing_time"),
         rulesProcessed: integer("rules_processed"),
+        engineVersion: text("engine_version").notNull().default("v1.0"),
 
         createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
         updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
     },
     (t) => ({
-        // Indexes
         idxFormResponse: index("spam_assessments_form_response_idx").on(t.formResponseId).where(sql`${t.formResponseId} IS NOT NULL`),
         idxBooking: index("spam_assessments_booking_idx").on(t.bookingId).where(sql`${t.bookingId} IS NOT NULL`),
         idxOrgSpamRisk: index("spam_assessments_org_spam_risk_idx").on(t.organizationId, t.spamScore, t.riskLevel, t.isSpam),
         idxReviewRequired: index("spam_assessments_review_required_idx").on(t.requiresReview, t.reviewStatus).where(sql`${t.requiresReview} = true`),
         idxCreatedScore: index("spam_assessments_created_score_idx").on(t.createdAt, t.spamScore),
+        idxNovuTrigger: index("spam_assessments_novu_trigger_idx").on(t.novuTriggerId).where(sql`${t.novuTriggerId} IS NOT NULL`),
 
-        // Constraints
         chkSpamScore: sql`CHECK (${t.spamScore} >= 0 AND ${t.spamScore} <= 100)`,
         chkConfidence: sql`CHECK (${t.confidence} >= 0 AND ${t.confidence} <= 1)`,
         chkMlPrediction: sql`CHECK (${t.mlPrediction} IS NULL OR (${t.mlPrediction} >= 0 AND ${t.mlPrediction} <= 1))`,
@@ -248,7 +323,7 @@ export const spamAssessments = pgTable(
 );
 
 /**
- * Email Verifications - Enhanced tracking
+ * Email Verifications - Enhanced with Novu integration
  */
 export const emailVerifications = pgTable(
     "email_verifications",
@@ -258,6 +333,11 @@ export const emailVerifications = pgTable(
         bookingId: text("booking_id").references(() => bookings.id, { onDelete: "cascade" }),
         spamAssessmentId: text("spam_assessment_id").references(() => spamAssessments.id, { onDelete: "cascade" }),
         organizationId: text("organization_id").references(() => organizations.id, { onDelete: "cascade" }),
+
+        // Novu integration
+        novuTriggerId: text("novu_trigger_id").references(() => novuTriggers.id, { onDelete: "set null" }),
+        novuMessageId: text("novu_message_id"),
+        novuWorkflowId: text("novu_workflow_id").references(() => novuWorkflows.id, { onDelete: "set null" }),
 
         email: text("email").notNull(),
         verificationToken: text("verification_token").notNull(),
@@ -308,21 +388,20 @@ export const emailVerifications = pgTable(
         localizedInstructions: text("localized_instructions"),
 
         // Cultural context for verification
-        culturalContext: jsonb("cultural_context"), // Region-specific verification preferences
+        culturalContext: jsonb("cultural_context"),
 
         createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
         updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
     },
     (t) => ({
-        // Indexes
         uqToken: uniqueIndex("email_verifications_token_uq").on(t.verificationToken),
         uqCode: uniqueIndex("email_verifications_code_uq").on(t.verificationCode).where(sql`${t.verificationCode} IS NOT NULL`),
         idxEmail: index("email_verifications_email_idx").on(t.email),
         idxStatusExpiry: index("email_verifications_status_expiry_idx").on(t.status, t.expiresAt),
         idxDeliveryStatus: index("email_verifications_delivery_idx").on(t.deliveryStatus, t.createdAt),
         idxOrgStatus: index("email_verifications_org_status_idx").on(t.organizationId, t.status),
+        idxNovuTrigger: index("email_verifications_novu_trigger_idx").on(t.novuTriggerId).where(sql`${t.novuTriggerId} IS NOT NULL`),
 
-        // Constraints
         chkEmailFormat: sql`CHECK (${t.email} ~ '^[^@]+@[^@]+\\.[^@]+')`,
         chkAttempts: sql`CHECK (${t.attempts} >= 0)`,
         chkMaxAttempts: sql`CHECK (${t.maxAttempts} > 0)`,
@@ -335,7 +414,46 @@ export const emailVerifications = pgTable(
 );
 
 /**
- * Blocked Entities - Enhanced tracking (essential fields only)
+ * Spam Prevention Events - Track all spam-related events for analytics
+ */
+export const spamPreventionEvents = pgTable(
+    "spam_prevention_events",
+    {
+        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
+        organizationId: text("organization_id").references(() => organizations.id, { onDelete: "cascade" }),
+        formId: text("form_id").references(() => forms.id, { onDelete: "cascade" }),
+        assessmentId: text("assessment_id").references(() => spamAssessments.id, { onDelete: "cascade" }),
+
+        eventType: text("event_type").notNull(), // submission, verification, block, review, etc.
+        eventSubtype: text("event_subtype"),
+        severity: text("severity").notNull().default("info"),
+
+        // Source information
+        ipAddress: text("ip_address"),
+        userAgent: text("user_agent"),
+        country: text("country"),
+        source: text("source").notNull().default("spam_engine"),
+
+        // Event data
+        payload: jsonb("payload"),
+        metadata: jsonb("metadata"),
+
+        // Novu integration
+        novuTriggerId: text("novu_trigger_id").references(() => novuTriggers.id, { onDelete: "set null" }),
+        notificationSent: boolean("notification_sent").notNull().default(false),
+
+        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
+    },
+    (t) => ({
+        idxOrgEventType: index("spam_prevention_events_org_event_type_idx").on(t.organizationId, t.eventType, t.createdAt),
+        idxFormCreated: index("spam_prevention_events_form_created_idx").on(t.formId, t.createdAt),
+        idxSeverity: index("spam_prevention_events_severity_idx").on(t.severity, t.createdAt),
+        idxAssessment: index("spam_prevention_events_assessment_idx").on(t.assessmentId).where(sql`${t.assessmentId} IS NOT NULL`),
+    })
+);
+
+/**
+ * Blocked Entities - Enhanced tracking
  */
 export const blockedEntities = pgTable(
     "blocked_entities",
@@ -346,13 +464,12 @@ export const blockedEntities = pgTable(
 
         entityType: text("entity_type").notNull(), // ip, email, phone, domain, user_agent
         entityValue: text("entity_value").notNull(),
-        entityHash: text("entity_hash"), // Hashed version for privacy
+        entityHash: text("entity_hash"),
 
         // Block configuration
         blockType: text("block_type").notNull(), // manual, automatic, temporary, permanent
         blockReason: blockReasonEnum("block_reason").notNull(),
         severity: integer("severity").notNull(),
-        description: text("description"),
 
         // Automatic blocking
         isAutomatic: boolean("is_automatic").notNull().default(false),
@@ -364,12 +481,12 @@ export const blockedEntities = pgTable(
         expiresAt: timestamp("expires_at", { mode: "date" }),
         autoUnblockAt: timestamp("auto_unblock_at", { mode: "date" }),
 
-        // Geographic info (for IPs only)
+        // Geographic info
         country: varchar("country", { length: 2 }),
         region: text("region"),
         city: text("city"),
         isp: text("isp"),
-        asn: integer("asn"), // Autonomous System Number
+        asn: integer("asn"),
         isVpn: boolean("is_vpn").notNull().default(false),
         isProxy: boolean("is_proxy").notNull().default(false),
         isTor: boolean("is_tor").notNull().default(false),
@@ -381,17 +498,18 @@ export const blockedEntities = pgTable(
         lastAttempt: timestamp("last_attempt", { mode: "date" }),
         lastBlocked: timestamp("last_blocked", { mode: "date" }),
 
-        // Appeal process (simplified)
+        // Appeal process
         appealSubmitted: boolean("appeal_submitted").notNull().default(false),
         appealedAt: timestamp("appealed_at", { mode: "date" }),
         appealReason: text("appeal_reason"),
-        appealStatus: text("appeal_status"), // pending, approved, rejected
-        reviewedBy: text("reviewed_by")
-            .references(() => users.id, { onDelete: "set null" }),
+        appealStatus: text("appeal_status"),
 
-        // Management
-        blockedBy: text("blocked_by")
-            .references(() => users.id, { onDelete: "set null" }),
+        // Novu integration for appeal notifications
+        novuAppealTriggerId: text("novu_appeal_trigger_id").references(() => novuTriggers.id, { onDelete: "set null" }),
+        appealNotificationSent: boolean("appeal_notification_sent").notNull().default(false),
+
+        reviewedBy: text("reviewed_by").references(() => users.id, { onDelete: "set null" }),
+        blockedBy: text("blocked_by").references(() => users.id, { onDelete: "set null" }),
         isActive: boolean("is_active").notNull().default(true),
 
         // External data
@@ -402,20 +520,12 @@ export const blockedEntities = pgTable(
         updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
     },
     (t) => ({
-        uqEntityTypeValue: uniqueIndex("blocked_entities_type_value_uq")
-            .on(t.entityType, t.entityValue),
-        idxActiveType: index("blocked_entities_active_type_idx")
-            .on(t.isActive, t.entityType)
-            .where(sql`${t.isActive} = true`),
-        idxExpiryActive: index("blocked_entities_expiry_active_idx")
-            .on(t.expiresAt, t.isActive)
-            .where(sql`${t.expiresAt} IS NOT NULL AND ${t.isActive} = true`),
-        idxCountrySeverity: index("blocked_entities_country_severity_idx")
-            .on(t.country, t.severity)
-            .where(sql`${t.country} IS NOT NULL`),
+        uqEntityTypeValue: uniqueIndex("blocked_entities_type_value_uq").on(t.entityType, t.entityValue),
+        idxActiveType: index("blocked_entities_active_type_idx").on(t.isActive, t.entityType).where(sql`${t.isActive} = true`),
+        idxExpiryActive: index("blocked_entities_expiry_active_idx").on(t.expiresAt, t.isActive).where(sql`${t.expiresAt} IS NOT NULL AND ${t.isActive} = true`),
+        idxCountrySeverity: index("blocked_entities_country_severity_idx").on(t.country, t.severity).where(sql`${t.country} IS NOT NULL`),
         idxOrgTeam: index("blocked_entities_org_team_idx").on(t.organizationId, t.teamId),
 
-        // Constraints
         chkSeverity: sql`CHECK (${t.severity} >= 1 AND ${t.severity} <= 10)`,
         chkTriggerThreshold: sql`CHECK (${t.triggerThreshold} IS NULL OR ${t.triggerThreshold} > 0)`,
         chkTotalAttempts: sql`CHECK (${t.totalAttempts} >= 0)`,
@@ -432,12 +542,9 @@ export const spamPreventionAnalytics = pgTable(
         id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
 
         date: timestamp("date", { mode: "date" }).notNull(),
-        userId: text("user_id")
-            .references(() => users.id, { onDelete: "cascade" }),
-        organizationId: text("organization_id")
-            .references(() => organizations.id, { onDelete: "cascade" }),
-        formId: text("form_id")
-            .references(() => forms.id, { onDelete: "cascade" }),
+        userId: text("user_id").references(() => users.id, { onDelete: "cascade" }),
+        organizationId: text("organization_id").references(() => organizations.id, { onDelete: "cascade" }),
+        formId: text("form_id").references(() => forms.id, { onDelete: "cascade" }),
 
         // Core submission counts
         totalSubmissions: integer("total_submissions").notNull().default(0),
@@ -446,53 +553,40 @@ export const spamPreventionAnalytics = pgTable(
         blockedSubmissions: integer("blocked_submissions").notNull().default(0),
         flaggedSubmissions: integer("flagged_submissions").notNull().default(0),
 
-        // Email verification statistics only
+        // Email verification statistics
         emailVerificationsRequested: integer("email_verifications_requested").notNull().default(0),
         emailVerificationsCompleted: integer("email_verifications_completed").notNull().default(0),
 
-        // Quality scores with validation
+        // Novu integration metrics
+        novuNotificationsSent: integer("novu_notifications_sent").notNull().default(0),
+        novuVerificationsSent: integer("novu_verifications_sent").notNull().default(0),
+        novuAdminAlertsSent: integer("novu_admin_alerts_sent").notNull().default(0),
+
+        // Quality scores
         averageSpamScore: real("average_spam_score").notNull().default(0),
         averageQualityScore: real("average_quality_score").notNull().default(0),
         spamDetectionAccuracy: real("spam_detection_accuracy").notNull().default(0),
         falsePositiveRate: real("false_positive_rate").notNull().default(0),
         falseNegativeRate: real("false_negative_rate").notNull().default(0),
 
-        // Aggregated insights
-        rulesTriggered: jsonb("rules_triggered"),
-        topFraudIndicators: jsonb("top_fraud_indicators"),
-        topSpamCountries: jsonb("top_spam_countries"),
-        topSpamIsps: jsonb("top_spam_isps"),
-        vpnTrafficPercentage: real("vpn_traffic_percentage").notNull().default(0),
-
-        // Manual review workload
-        manualReviewsRequired: integer("manual_reviews_required").notNull().default(0),
-        manualReviewsCompleted: integer("manual_reviews_completed").notNull().default(0),
-        averageReviewTime: integer("average_review_time"),
-
-        // Cost tracking (email only)
-        verificationCosts: real("verification_costs").notNull().default(0),
-        externalServiceCosts: real("external_service_costs").notNull().default(0),
-
         // Performance metrics
         averageProcessingTime: integer("average_processing_time"),
         systemUptime: real("system_uptime").notNull().default(100),
 
+        // Cost tracking
+        verificationCosts: real("verification_costs").notNull().default(0),
+        externalServiceCosts: real("external_service_costs").notNull().default(0),
+        novuServiceCosts: real("novu_service_costs").notNull().default(0),
+
         createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
     },
     (t) => ({
-        uqDateOrg: uniqueIndex("spam_prevention_analytics_date_org_uq")
-            .on(t.date, t.organizationId)
-            .where(sql`${t.organizationId} IS NOT NULL`),
-        uqDateForm: uniqueIndex("spam_prevention_analytics_date_form_uq")
-            .on(t.date, t.formId)
-            .where(sql`${t.formId} IS NOT NULL`),
-        idxDate: index("spam_prevention_analytics_date_idx")
-            .on(t.date),
-        idxAccuracy: index("spam_prevention_analytics_accuracy_idx")
-            .on(t.spamDetectionAccuracy, t.date),
+        uqDateOrg: uniqueIndex("spam_prevention_analytics_date_org_uq").on(t.date, t.organizationId).where(sql`${t.organizationId} IS NOT NULL`),
+        uqDateForm: uniqueIndex("spam_prevention_analytics_date_form_uq").on(t.date, t.formId).where(sql`${t.formId} IS NOT NULL`),
+        idxDate: index("spam_prevention_analytics_date_idx").on(t.date),
+        idxAccuracy: index("spam_prevention_analytics_accuracy_idx").on(t.spamDetectionAccuracy, t.date),
         idxOrgDate: index("spam_prevention_analytics_org_date_idx").on(t.organizationId, t.date),
 
-        // Constraints
         chkTotalSubmissions: sql`CHECK (${t.totalSubmissions} >= 0)`,
         chkLegitimateSubmissions: sql`CHECK (${t.legitimateSubmissions} >= 0)`,
         chkSpamSubmissions: sql`CHECK (${t.spamSubmissions} >= 0)`,
@@ -500,137 +594,44 @@ export const spamPreventionAnalytics = pgTable(
         chkFlaggedSubmissions: sql`CHECK (${t.flaggedSubmissions} >= 0)`,
         chkEmailVerificationsRequested: sql`CHECK (${t.emailVerificationsRequested} >= 0)`,
         chkEmailVerificationsCompleted: sql`CHECK (${t.emailVerificationsCompleted} >= 0)`,
+        chkNovuMetrics: sql`CHECK (${t.novuNotificationsSent} >= 0 AND ${t.novuVerificationsSent} >= 0 AND ${t.novuAdminAlertsSent} >= 0)`,
         chkAverageSpamScore: sql`CHECK (${t.averageSpamScore} >= 0 AND ${t.averageSpamScore} <= 100)`,
         chkAverageQualityScore: sql`CHECK (${t.averageQualityScore} >= 0 AND ${t.averageQualityScore} <= 100)`,
         chkSpamDetectionAccuracy: sql`CHECK (${t.spamDetectionAccuracy} >= 0 AND ${t.spamDetectionAccuracy} <= 100)`,
         chkFalsePositiveRate: sql`CHECK (${t.falsePositiveRate} >= 0 AND ${t.falsePositiveRate} <= 100)`,
         chkFalseNegativeRate: sql`CHECK (${t.falseNegativeRate} >= 0 AND ${t.falseNegativeRate} <= 100)`,
-        chkVpnTrafficPercentage: sql`CHECK (${t.vpnTrafficPercentage} >= 0 AND ${t.vpnTrafficPercentage} <= 100)`,
-        chkManualReviewsRequired: sql`CHECK (${t.manualReviewsRequired} >= 0)`,
-        chkManualReviewsCompleted: sql`CHECK (${t.manualReviewsCompleted} >= 0)`,
-        chkAverageReviewTime: sql`CHECK (${t.averageReviewTime} IS NULL OR ${t.averageReviewTime} > 0)`,
-        chkVerificationCosts: sql`CHECK (${t.verificationCosts} >= 0)`,
-        chkExternalServiceCosts: sql`CHECK (${t.externalServiceCosts} >= 0)`,
-        chkAverageProcessingTime: sql`CHECK (${t.averageProcessingTime} IS NULL OR ${t.averageProcessingTime} >= 0)`,
         chkSystemUptime: sql`CHECK (${t.systemUptime} >= 0 AND ${t.systemUptime} <= 100)`,
-    })
-);
-
-/* ---------------- Localized Verification Messages ---------------- */
-export const verificationMessageTranslations = pgTable(
-    "verification_message_translations",
-    {
-        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-
-        messageType: text("message_type").notNull(), // "email_verification", "blocked_entity"
-        languageCode: text("language_code").notNull().references(() => supportedLanguages.code, { onDelete: "restrict" }),
-
-        // Email verification messages only
-        emailSubject: text("email_subject"),
-        emailBody: text("email_body"),
-
-        // Blocked entity messages
-        blockedMessage: text("blocked_message"),
-        appealInstructions: text("appeal_instructions"),
-
-        // General verification instructions
-        verificationInstructions: text("verification_instructions"),
-        resendInstructions: text("resend_instructions"),
-
-        // Error messages
-        errorMessages: jsonb("error_messages"), // { expired, invalid_code, max_attempts, etc. }
-
-        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
-        updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
-    },
-    (t) => ({
-        uqTypeLanguage: uniqueIndex("verification_message_translations_type_language_uq").on(t.messageType, t.languageCode),
-        idxMessageType: index("verification_message_translations_type_idx").on(t.messageType),
-        idxLanguage: index("verification_message_translations_language_idx").on(t.languageCode),
-    })
-);
-
-/* ---------------- Localized Spam Assessment Messages ---------------- */
-export const spamAssessmentTranslations = pgTable(
-    "spam_assessment_translations",
-    {
-        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        assessmentId: text("assessment_id").notNull().references(() => spamAssessments.id, { onDelete: "cascade" }),
-        languageCode: text("language_code").notNull().references(() => supportedLanguages.code, { onDelete: "restrict" }),
-
-        // Localized review messages
-        reviewNotes: text("review_notes"),
-        reviewDecision: text("review_decision"),
-
-        // Localized risk factor explanations
-        localizedRiskFactors: jsonb("localized_risk_factors"),
-        localizedRecommendations: jsonb("localized_recommendations"),
-
-        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
-        updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
-    },
-    (t) => ({
-        uqAssessmentLanguage: uniqueIndex("spam_assessment_translations_assessment_language_uq").on(t.assessmentId, t.languageCode),
-    })
-);
-
-/* ---------------- Localized Blocked Entity Messages ---------------- */
-export const blockedEntityTranslations = pgTable(
-    "blocked_entity_translations",
-    {
-        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        blockedEntityId: text("blocked_entity_id").notNull().references(() => blockedEntities.id, { onDelete: "cascade" }),
-        languageCode: text("language_code").notNull().references(() => supportedLanguages.code, { onDelete: "restrict" }),
-
-        // Localized block information
-        description: text("description"),
-        appealReason: text("appeal_reason"),
-
-        // Localized user-facing messages
-        userMessage: text("user_message"), // What the user sees when blocked
-        appealInstructions: text("appeal_instructions"),
-        contactInstructions: text("contact_instructions"),
-
-        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
-        updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
-    },
-    (t) => ({
-        uqEntityLanguage: uniqueIndex("blocked_entity_translations_entity_language_uq").on(t.blockedEntityId, t.languageCode),
-    })
-);
-
-/* ---------------- Regional Spam Detection Rules ---------------- */
-export const regionalSpamRules = pgTable(
-    "regional_spam_rules",
-    {
-        id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-        ruleId: text("rule_id").notNull().references(() => spamDetectionRules.id, { onDelete: "cascade" }),
-
-        // Regional targeting
-        regions: jsonb("regions").notNull(), // Array of region codes this rule applies to
-        languages: jsonb("languages").notNull(), // Array of language codes
-
-        // Region-specific rule configuration
-        regionalConditions: jsonb("regional_conditions"), // Conditions that vary by region
-        culturalAdjustments: jsonb("cultural_adjustments"), // Cultural sensitivity adjustments
-
-        // Localized rule descriptions
-        localizedDescriptions: jsonb("localized_descriptions"), // Per-language descriptions
-
-        isActive: boolean("is_active").notNull().default(true),
-
-        createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
-        updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
-    },
-    (t) => ({
-        idxRule: index("regional_spam_rules_rule_idx").on(t.ruleId),
-        idxActive: index("regional_spam_rules_active_idx").on(t.isActive),
+        chkAverageProcessingTime: sql`CHECK (${t.averageProcessingTime} IS NULL OR ${t.averageProcessingTime} >= 0)`,
+        chkCosts: sql`CHECK (${t.verificationCosts} >= 0 AND ${t.externalServiceCosts} >= 0 AND ${t.novuServiceCosts} >= 0)`,
     })
 );
 
 /* ============================
    Relations
    ============================ */
+
+export const spamEngineConfigRelations = relations(spamEngineConfig, ({ one }) => ({
+    organization: one(organizations, {
+        fields: [spamEngineConfig.organizationId],
+        references: [organizations.id],
+        relationName: "spam_engine_config_organization"
+    }),
+    user: one(users, {
+        fields: [spamEngineConfig.userId],
+        references: [users.id],
+        relationName: "spam_engine_config_user"
+    }),
+    novuWorkflow: one(novuWorkflows, {
+        fields: [spamEngineConfig.novuWorkflowId],
+        references: [novuWorkflows.id],
+        relationName: "spam_engine_novu_workflow"
+    }),
+    novuVerificationWorkflow: one(novuWorkflows, {
+        fields: [spamEngineConfig.novuVerificationWorkflowId],
+        references: [novuWorkflows.id],
+        relationName: "spam_engine_novu_verification_workflow"
+    }),
+}));
 
 export const spamDetectionRulesRelations = relations(spamDetectionRules, ({ one, many }) => ({
     owner: one(users, {
@@ -658,8 +659,10 @@ export const spamDetectionRulesRelations = relations(spamDetectionRules, ({ one,
         references: [users.id],
         relationName: "spam_detection_rule_modifier"
     }),
-    regionalRules: many(regionalSpamRules, {
-        relationName: "spam_detection_rule_regional_rules"
+    novuWorkflow: one(novuWorkflows, {
+        fields: [spamDetectionRules.novuWorkflowId],
+        references: [novuWorkflows.id],
+        relationName: "spam_detection_rule_novu_workflow"
     }),
 }));
 
@@ -684,12 +687,26 @@ export const spamAssessmentsRelations = relations(spamAssessments, ({ one, many 
         references: [users.id],
         relationName: "spam_assessment_reviewer"
     }),
-    translations: many(spamAssessmentTranslations, {
-        relationName: "spam_assessment_translations"
+    novuTrigger: one(novuTriggers, {
+        fields: [spamAssessments.novuTriggerId],
+        references: [novuTriggers.id],
+        relationName: "spam_assessment_novu_trigger"
     }),
-    // Only email verifications now
+    novuVerificationTrigger: one(novuTriggers, {
+        fields: [spamAssessments.novuVerificationTriggerId],
+        references: [novuTriggers.id],
+        relationName: "spam_assessment_novu_verification_trigger"
+    }),
+    novuSubscriber: one(novuSubscribers, {
+        fields: [spamAssessments.novuSubscriberId],
+        references: [novuSubscribers.id],
+        relationName: "spam_assessment_novu_subscriber"
+    }),
     emailVerifications: many(emailVerifications, {
         relationName: "spam_assessment_email_verifications"
+    }),
+    events: many(spamPreventionEvents, {
+        relationName: "spam_assessment_events"
     }),
 }));
 
@@ -714,6 +731,16 @@ export const emailVerificationsRelations = relations(emailVerifications, ({ one 
         references: [organizations.id],
         relationName: "email_verification_organization"
     }),
+    novuTrigger: one(novuTriggers, {
+        fields: [emailVerifications.novuTriggerId],
+        references: [novuTriggers.id],
+        relationName: "email_verification_novu_trigger"
+    }),
+    novuWorkflow: one(novuWorkflows, {
+        fields: [emailVerifications.novuWorkflowId],
+        references: [novuWorkflows.id],
+        relationName: "email_verification_novu_workflow"
+    }),
     detectedLanguageRef: one(supportedLanguages, {
         fields: [emailVerifications.detectedLanguage],
         references: [supportedLanguages.code],
@@ -723,6 +750,29 @@ export const emailVerificationsRelations = relations(emailVerifications, ({ one 
         fields: [emailVerifications.preferredLanguage],
         references: [supportedLanguages.code],
         relationName: "email_verification_preferred_language"
+    }),
+}));
+
+export const spamPreventionEventsRelations = relations(spamPreventionEvents, ({ one }) => ({
+    organization: one(organizations, {
+        fields: [spamPreventionEvents.organizationId],
+        references: [organizations.id],
+        relationName: "spam_prevention_event_organization"
+    }),
+    form: one(forms, {
+        fields: [spamPreventionEvents.formId],
+        references: [forms.id],
+        relationName: "spam_prevention_event_form"
+    }),
+    assessment: one(spamAssessments, {
+        fields: [spamPreventionEvents.assessmentId],
+        references: [spamAssessments.id],
+        relationName: "spam_prevention_event_assessment"
+    }),
+    novuTrigger: one(novuTriggers, {
+        fields: [spamPreventionEvents.novuTriggerId],
+        references: [novuTriggers.id],
+        relationName: "spam_prevention_event_novu_trigger"
     }),
 }));
 
@@ -747,8 +797,10 @@ export const blockedEntitiesRelations = relations(blockedEntities, ({ one, many 
         references: [users.id],
         relationName: "blocked_entity_reviewed_by"
     }),
-    translations: many(blockedEntityTranslations, {
-        relationName: "blocked_entity_translations"
+    novuAppealTrigger: one(novuTriggers, {
+        fields: [blockedEntities.novuAppealTriggerId],
+        references: [novuTriggers.id],
+        relationName: "blocked_entity_novu_appeal_trigger"
     }),
 }));
 
@@ -767,48 +819,5 @@ export const spamPreventionAnalyticsRelations = relations(spamPreventionAnalytic
         fields: [spamPreventionAnalytics.formId],
         references: [forms.id],
         relationName: "spam_analytics_form"
-    }),
-}));
-
-// Relations for translation tables
-export const verificationMessageTranslationsRelations = relations(verificationMessageTranslations, ({ one }) => ({
-    language: one(supportedLanguages, {
-        fields: [verificationMessageTranslations.languageCode],
-        references: [supportedLanguages.code],
-        relationName: "verification_message_language"
-    }),
-}));
-
-export const spamAssessmentTranslationsRelations = relations(spamAssessmentTranslations, ({ one }) => ({
-    assessment: one(spamAssessments, {
-        fields: [spamAssessmentTranslations.assessmentId],
-        references: [spamAssessments.id],
-        relationName: "spam_assessment_translation_assessment"
-    }),
-    language: one(supportedLanguages, {
-        fields: [spamAssessmentTranslations.languageCode],
-        references: [supportedLanguages.code],
-        relationName: "spam_assessment_translation_language"
-    }),
-}));
-
-export const blockedEntityTranslationsRelations = relations(blockedEntityTranslations, ({ one }) => ({
-    blockedEntity: one(blockedEntities, {
-        fields: [blockedEntityTranslations.blockedEntityId],
-        references: [blockedEntities.id],
-        relationName: "blocked_entity_translation_entity"
-    }),
-    language: one(supportedLanguages, {
-        fields: [blockedEntityTranslations.languageCode],
-        references: [supportedLanguages.code],
-        relationName: "blocked_entity_translation_language"
-    }),
-}));
-
-export const regionalSpamRulesRelations = relations(regionalSpamRules, ({ one }) => ({
-    rule: one(spamDetectionRules, {
-        fields: [regionalSpamRules.ruleId],
-        references: [spamDetectionRules.id],
-        relationName: "regional_spam_rule_parent"
     }),
 }));

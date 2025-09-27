@@ -16,6 +16,8 @@ import { users, organizations } from "@/db/schema/auth";
 import { forms, formResponses } from "@/db/schema/forms";
 import { bookings, eventTypes } from "@/db/schema/scheduling";
 import { conversationalFlows } from "@/db/schema/conversationalFlow";
+import { calendarConnections, externalCalendarEvents } from "@/db/schema/calendar-core";
+import { videoConferenceConnections, videoMeetings } from "@/db/schema/video-conference-core";
 
 /* ---------------- Enums ---------------- */
 export const novuChannelEnum = pgEnum("novu_channel", [
@@ -55,6 +57,28 @@ export const novuSubscriberPriorityEnum = pgEnum("novu_subscriber_priority", [
     "urgent",
 ]);
 
+export const novuResourceTypeEnum = pgEnum("novu_resource_type", [
+    // Core SchedForm resources
+    "form_response",
+    "booking",
+    "flow_event",
+
+    // Calendar integration resources
+    "calendar_sync",
+    "availability_change",
+    "external_event",
+
+    // Video conference resources
+    "video_meeting_started",
+    "video_meeting_ended",
+    "recording_ready",
+    "transcript_available",
+
+    // System events
+    "system_alert",
+    "usage_limit",
+]);
+
 /* ---------------- Novu Core Configuration ---------------- */
 export const novuConfigurations = pgTable(
     "novu_configurations",
@@ -82,6 +106,11 @@ export const novuConfigurations = pgTable(
         webhookUrl: text("webhook_url"),
         webhookSecret: text("webhook_secret"),
         webhookEnabled: boolean("webhook_enabled").default(false),
+
+        // Extended integration settings
+        enableCalendarNotifications: boolean("enable_calendar_notifications").default(true),
+        enableVideoNotifications: boolean("enable_video_notifications").default(true),
+        enableSystemAlerts: boolean("enable_system_alerts").default(true),
 
         // Performance Tracking
         totalNotificationsSent: integer("total_notifications_sent").default(0),
@@ -133,6 +162,11 @@ export const novuSubscribers = pgTable(
         locale: text("locale"),
         timezone: text("timezone"),
 
+        // Extended preferences for calendar and video notifications
+        calendarNotificationsEnabled: boolean("calendar_notifications_enabled").default(true),
+        videoNotificationsEnabled: boolean("video_notifications_enabled").default(true),
+        systemAlertsEnabled: boolean("system_alerts_enabled").default(true),
+
         // Channel preferences
         emailEnabled: boolean("email_enabled").default(true),
         chatEnabled: boolean("chat_enabled").default(true),
@@ -177,16 +211,27 @@ export const novuWorkflows = pgTable(
         workflowId: text("workflow_id").notNull(), // Novu workflow identifier
         name: text("name").notNull(),
         description: text("description"),
-        category: text("category"), // "form", "booking", "system", "marketing"
+        category: text("category"), // "form", "booking", "system", "marketing", "calendar", "video"
 
-        // Associated resources
+        // Associated resources (polymorphic approach)
+        resourceType: novuResourceTypeEnum("resource_type"), // Type of resource this workflow handles
+        resourceConfig: jsonb("resource_config"), // Configuration for specific resource types
+
+        // Extended resource associations
         formId: text("form_id").references(() => forms.id, { onDelete: "set null" }),
         eventTypeId: text("event_type_id").references(() => eventTypes.id, { onDelete: "set null" }),
+        calendarConnectionId: text("calendar_connection_id").references(() => calendarConnections.id, { onDelete: "set null" }),
+        videoConnectionId: text("video_connection_id").references(() => videoConferenceConnections.id, { onDelete: "set null" }),
 
         // Workflow configuration
         triggers: jsonb("triggers").notNull(), // Array of trigger events
         steps: jsonb("steps").notNull(), // Workflow steps configuration
         preferenceSettings: jsonb("preference_settings"), // Channel preferences
+
+        // Extended notification settings
+        notificationTriggers: jsonb("notification_triggers"), // Specific conditions for triggering
+        escalationRules: jsonb("escalation_rules"), // Rules for escalating notifications
+        timeBasedRules: jsonb("time_based_rules"), // Time-based notification rules
 
         // Status and activation
         status: novuWorkflowStatusEnum("status").default("active"),
@@ -215,6 +260,7 @@ export const novuWorkflows = pgTable(
         idxCategory: index("novu_workflows_category_idx").on(t.category),
         idxActive: index("novu_workflows_active_idx").on(t.isActive),
         idxForm: index("novu_workflows_form_idx").on(t.formId).where(sql`${t.formId} IS NOT NULL`),
+        idxResourceType: index("novu_workflows_resource_type_idx").on(t.resourceType),
     })
 );
 
@@ -230,19 +276,29 @@ export const novuTriggers = pgTable(
             .notNull()
             .references(() => organizations.id, { onDelete: "cascade" }),
 
-        // Trigger source
-        resourceType: text("resource_type").notNull(), // "form_response", "booking", "flow_event"
+        // Trigger source with extended resource types
+        resourceType: novuResourceTypeEnum("resource_type").notNull(),
         resourceId: text("resource_id").notNull(), // ID of the triggering resource
 
-        // Associated entities
+        // Polymorphic resource references (JSONB for flexibility)
+        resourceReferences: jsonb("resource_references").notNull().default({}), // Contains all relevant resource IDs
+
+        // Associated entities (direct foreign keys for common cases)
         formResponseId: text("form_response_id").references(() => formResponses.id, { onDelete: "set null" }),
         bookingId: text("booking_id").references(() => bookings.id, { onDelete: "set null" }),
         flowId: text("flow_id").references(() => conversationalFlows.id, { onDelete: "set null" }),
+        calendarConnectionId: text("calendar_connection_id").references(() => calendarConnections.id, { onDelete: "set null" }),
+        videoMeetingId: text("video_meeting_id").references(() => videoMeetings.id, { onDelete: "set null" }),
+        externalEventId: text("external_event_id").references(() => externalCalendarEvents.id, { onDelete: "set null" }),
 
         // Trigger data
         triggerName: text("trigger_name").notNull(),
         payload: jsonb("payload").notNull(), // Data sent to Novu
         overrides: jsonb("overrides"), // Provider overrides
+
+        // Extended context for calendar and video events
+        eventContext: jsonb("event_context"), // Additional context for the event
+        timingData: jsonb("timing_data"), // Time-based data for the trigger
 
         // Recipient information
         toSubscriberId: text("to_subscriber_id").references(() => novuSubscribers.id, { onDelete: "set null" }),
@@ -277,6 +333,8 @@ export const novuTriggers = pgTable(
         idxResource: index("novu_triggers_resource_idx").on(t.resourceType, t.resourceId),
         idxWorkflow: index("novu_triggers_workflow_idx").on(t.workflowId),
         idxOrganization: index("novu_triggers_organization_idx").on(t.organizationId),
+        idxCalendarConnection: index("novu_triggers_calendar_connection_idx").on(t.calendarConnectionId).where(sql`${t.calendarConnectionId} IS NOT NULL`),
+        idxVideoMeeting: index("novu_triggers_video_meeting_idx").on(t.videoMeetingId).where(sql`${t.videoMeetingId} IS NOT NULL`),
     })
 );
 
@@ -300,6 +358,10 @@ export const novuMessages = pgTable(
         channel: novuChannelEnum("channel").notNull(),
         providerId: novuProviderEnum("provider_id"),
         templateId: text("template_id"),
+
+        // Extended message context
+        contextType: novuResourceTypeEnum("context_type"), // Context of the message
+        contextData: jsonb("context_data"), // Additional context data
 
         // Content
         subject: text("subject"),
@@ -339,6 +401,7 @@ export const novuMessages = pgTable(
         idxSubscriber: index("novu_messages_subscriber_idx").on(t.subscriberId),
         idxTrigger: index("novu_messages_trigger_idx").on(t.triggerId),
         idxDestination: index("novu_messages_destination_idx").on(t.destination),
+        idxContextType: index("novu_messages_context_type_idx").on(t.contextType),
     })
 );
 
@@ -356,12 +419,16 @@ export const novuTopics = pgTable(
         name: text("name").notNull(),
         description: text("description"),
 
+        // Extended topic configuration
+        topicType: text("topic_type"), // "team", "calendar", "video", "system"
+        resourceAssociations: jsonb("resource_associations"), // Associated resources
+
         // Topic configuration
         isPublic: boolean("is_public").default(false),
         subscriberCount: integer("subscriber_count").default(0),
 
         // Associated resource
-        associatedType: text("associated_type"), // "team", "form", "event_type"
+        associatedType: text("associated_type"), // "team", "form", "event_type", "calendar", "video"
         associatedId: text("associated_id"),
 
         // Sync status
@@ -375,6 +442,7 @@ export const novuTopics = pgTable(
         uqTopicKey: uniqueIndex("novu_topics_topic_key_uq").on(t.topicKey),
         idxOrganization: index("novu_topics_organization_idx").on(t.organizationId),
         idxAssociated: index("novu_topics_associated_idx").on(t.associatedType, t.associatedId),
+        idxTopicType: index("novu_topics_topic_type_idx").on(t.topicType),
     })
 );
 
@@ -392,6 +460,10 @@ export const novuTopicSubscriptions = pgTable(
         organizationId: text("organization_id")
             .notNull()
             .references(() => organizations.id, { onDelete: "cascade" }),
+
+        // Extended subscription preferences
+        notificationTypes: jsonb("notification_types"), // Specific types of notifications to receive
+        deliveryRules: jsonb("delivery_rules"), // Rules for when to deliver notifications
 
         // Subscription preferences
         emailEnabled: boolean("email_enabled").default(true),
@@ -425,15 +497,17 @@ export const novuWebhookEvents = pgTable(
             .notNull()
             .references(() => organizations.id, { onDelete: "cascade" }),
 
-        // Webhook data
+        // Extended webhook data
         eventType: text("event_type").notNull(), // "notification.sent", "notification.delivered", etc.
+        eventCategory: text("event_category"), // "calendar", "video", "system", "form", "booking"
         payload: jsonb("payload").notNull(),
         signature: text("signature"),
         source: text("source").default("novu"),
 
-        // Associated notification
+        // Associated notification with extended context
         messageId: text("message_id").references(() => novuMessages.messageId, { onDelete: "set null" }),
         transactionId: text("transaction_id"),
+        resourceType: novuResourceTypeEnum("resource_type"), // Type of resource that triggered the webhook
 
         // Processing status
         processed: boolean("processed").default(false),
@@ -450,6 +524,8 @@ export const novuWebhookEvents = pgTable(
         idxEventType: index("novu_webhook_events_event_type_idx").on(t.eventType, t.createdAt),
         idxProcessed: index("novu_webhook_events_processed_idx").on(t.processed, t.createdAt),
         idxOrganization: index("novu_webhook_events_organization_idx").on(t.organizationId),
+        idxResourceType: index("novu_webhook_events_resource_type_idx").on(t.resourceType),
+        idxEventCategory: index("novu_webhook_events_event_category_idx").on(t.eventCategory),
     })
 );
 
@@ -465,6 +541,10 @@ export const novuAnalytics = pgTable(
         // Time period
         date: timestamp("date", { mode: "date" }).notNull(),
         period: text("period").notNull(), // "daily", "weekly", "monthly"
+
+        // Extended analytics by resource type
+        resourceTypeBreakdown: jsonb("resource_type_breakdown"), // Notifications by resource type
+        categoryBreakdown: jsonb("category_breakdown"), // Notifications by category
 
         // Channel statistics
         emailSent: integer("email_sent").default(0),
@@ -484,9 +564,10 @@ export const novuAnalytics = pgTable(
         inAppSent: integer("in_app_sent").default(0),
         inAppRead: integer("in_app_read").default(0),
 
-        // Workflow statistics
+        // Workflow statistics with extended breakdown
         workflowTriggers: jsonb("workflow_triggers"), // {workflowId: count}
         topWorkflows: jsonb("top_workflows"), // Most triggered workflows
+        resourceTypePerformance: jsonb("resource_type_performance"), // Performance by resource type
 
         // Performance metrics
         averageDeliveryTime: integer("average_delivery_time").default(0),
@@ -541,6 +622,14 @@ export const novuWorkflowsRelations = relations(novuWorkflows, ({ one, many }) =
         fields: [novuWorkflows.eventTypeId],
         references: [eventTypes.id],
     }),
+    calendarConnection: one(calendarConnections, {
+        fields: [novuWorkflows.calendarConnectionId],
+        references: [calendarConnections.id],
+    }),
+    videoConnection: one(videoConferenceConnections, {
+        fields: [novuWorkflows.videoConnectionId],
+        references: [videoConferenceConnections.id],
+    }),
     triggers: many(novuTriggers),
 }));
 
@@ -564,6 +653,18 @@ export const novuTriggersRelations = relations(novuTriggers, ({ one, many }) => 
     flow: one(conversationalFlows, {
         fields: [novuTriggers.flowId],
         references: [conversationalFlows.id],
+    }),
+    calendarConnection: one(calendarConnections, {
+        fields: [novuTriggers.calendarConnectionId],
+        references: [calendarConnections.id],
+    }),
+    videoMeeting: one(videoMeetings, {
+        fields: [novuTriggers.videoMeetingId],
+        references: [videoMeetings.id],
+    }),
+    externalEvent: one(externalCalendarEvents, {
+        fields: [novuTriggers.externalEventId],
+        references: [externalCalendarEvents.id],
     }),
     subscriber: one(novuSubscribers, {
         fields: [novuTriggers.toSubscriberId],

@@ -58,6 +58,31 @@ export class VideoConferenceErrorHandler {
         );
     }
 
+    static handleRecordingError(error: any): VideoConferenceError {
+        if (error.message?.includes('404')) {
+            return new VideoConferenceError(
+                'Recording not found or not yet available',
+                'RECORDING_NOT_AVAILABLE',
+                true, // Retryable - recording might be processing
+                error
+            );
+        } else if (error.message?.includes('403')) {
+            return new VideoConferenceError(
+                'Recording access denied - check permissions',
+                'RECORDING_ACCESS_DENIED',
+                false,
+                error
+            );
+        }
+
+        return new VideoConferenceError(
+            `Recording error: ${error.message}`,
+            'RECORDING_ERROR',
+            false,
+            error
+        );
+    }
+
     static handleGoogleMeetError(error: any): VideoConferenceError {
         if (error.code === 401) {
             return new VideoConferenceError(
@@ -150,3 +175,4 @@ export function withVideoRetry<T>(
         reject(lastError!);
     });
 }
+

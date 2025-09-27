@@ -29,3 +29,9 @@ export * from "./calendar-core";
 
 // Video Conferencing
 export * from "./video-conference-core";
+
+// Novu Notifications
+export * from "./novu";
+
+// HubSpot CRM
+export * from "./hubspot-crm-core";

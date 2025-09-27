@@ -30,20 +30,6 @@ export const triggerTypeEnum = pgEnum("trigger_type", [
     "scheduled_time",
 ]);
 
-// Updated to work through Novu instead of direct integrations
-export const actionTypeEnum = pgEnum("action_type", [
-    "send_novu_notification", // Replaces send_email, send_slack_message, send_sms
-    "webhook_call",
-    "zapier_trigger",
-    "create_booking",
-    "update_booking",
-    "assign_team_member",
-    "add_to_crm",
-    "create_task",
-    "delay",
-    "conditional_branch",
-]);
-
 export const workflowStatusEnum = pgEnum("workflow_status", [
     "active",
     "paused",
